@@ -1,45 +1,50 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAGIC: [u8; 4] = *b"TMUX";
-const HEADER_LEN: usize = 4 + 8 + 8;
+const IPERF_UDP_HEADER_LEN: usize = 12;
 
 #[derive(Debug, Clone, Copy)]
-pub struct UdpHeader {
+pub struct IperfUdpHeader {
     pub sequence: u64,
     pub sent_micros: u64,
 }
 
 #[must_use]
-pub fn build_packet(sequence: u64, payload_len: usize) -> Vec<u8> {
-    let mut packet = vec![0_u8; payload_len.max(HEADER_LEN)];
-    packet[..4].copy_from_slice(&MAGIC);
-    packet[4..12].copy_from_slice(&sequence.to_be_bytes());
+pub fn build_iperf_udp_packet(sequence: u32, payload_len: usize) -> Vec<u8> {
+    let size = payload_len.max(IPERF_UDP_HEADER_LEN);
+    let mut packet = vec![0_u8; size];
 
-    let now = now_micros();
-    packet[12..20].copy_from_slice(&now.to_be_bytes());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let sec = (now.as_secs().min(u32::MAX as u64) as u32).to_be_bytes();
+    let usec = (now.subsec_micros()).to_be_bytes();
+    let seq = sequence.to_be_bytes();
 
-    if payload_len > HEADER_LEN {
-        packet[HEADER_LEN..].fill(0x31);
+    packet[0..4].copy_from_slice(&sec);
+    packet[4..8].copy_from_slice(&usec);
+    packet[8..12].copy_from_slice(&seq);
+
+    if size > IPERF_UDP_HEADER_LEN {
+        packet[IPERF_UDP_HEADER_LEN..].fill(0x31);
     }
 
     packet
 }
 
 #[must_use]
-pub fn parse_header(packet: &[u8]) -> Option<UdpHeader> {
-    if packet.len() < HEADER_LEN || packet[..4] != MAGIC {
+pub fn parse_iperf_udp_header(packet: &[u8]) -> Option<IperfUdpHeader> {
+    if packet.len() < IPERF_UDP_HEADER_LEN {
         return None;
     }
 
-    let mut seq = [0_u8; 8];
-    seq.copy_from_slice(&packet[4..12]);
+    let sec = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    let usec = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    let seq = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+    let sent_micros = sec as u64 * 1_000_000 + usec as u64;
 
-    let mut ts = [0_u8; 8];
-    ts.copy_from_slice(&packet[12..20]);
-
-    Some(UdpHeader {
-        sequence: u64::from_be_bytes(seq),
-        sent_micros: u64::from_be_bytes(ts),
+    Some(IperfUdpHeader {
+        sequence: seq as u64,
+        sent_micros,
     })
 }
 
@@ -54,7 +59,7 @@ pub struct UdpReceiveMetrics {
 }
 
 impl UdpReceiveMetrics {
-    pub fn on_packet(&mut self, header: Option<UdpHeader>) {
+    pub fn on_packet(&mut self, header: Option<IperfUdpHeader>) {
         self.total_packets += 1;
 
         let Some(header) = header else {
@@ -77,9 +82,14 @@ impl UdpReceiveMetrics {
             }
         }
 
-        let now_micros = now_micros();
-        if now_micros >= header.sent_micros {
-            let transit_ms = (now_micros - header.sent_micros) as f64 / 1_000.0;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+
+        if now >= header.sent_micros {
+            let transit_ms = (now - header.sent_micros) as f64 / 1_000.0;
             if let Some(last) = self.last_transit_ms {
                 let delta = (transit_ms - last).abs();
                 self.jitter_ms += (delta - self.jitter_ms) / 16.0;
@@ -95,53 +105,25 @@ impl UdpReceiveMetrics {
         }
         Some((self.lost_packets as f64 * 100.0) / self.total_packets as f64)
     }
-
-    pub fn merge(&mut self, other: &Self) {
-        if other.total_packets == 0 {
-            return;
-        }
-
-        let combined_packets = self.total_packets + other.total_packets;
-        let weighted_jitter = if combined_packets == 0 {
-            0.0
-        } else {
-            ((self.jitter_ms * self.total_packets as f64)
-                + (other.jitter_ms * other.total_packets as f64))
-                / combined_packets as f64
-        };
-
-        self.total_packets = combined_packets;
-        self.lost_packets += other.lost_packets;
-        self.out_of_order += other.out_of_order;
-        self.jitter_ms = weighted_jitter;
-        self.last_transit_ms = other.last_transit_ms.or(self.last_transit_ms);
-    }
-}
-
-fn now_micros() -> u64 {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    duration.as_micros().min(u64::MAX as u128) as u64
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UdpReceiveMetrics, build_packet, parse_header};
+    use super::{UdpReceiveMetrics, build_iperf_udp_packet, parse_iperf_udp_header};
 
     #[test]
-    fn parses_packet_header_round_trip() {
-        let packet = build_packet(7, 1200);
-        let header = parse_header(&packet).expect("header should parse");
+    fn parses_iperf_udp_header_round_trip() {
+        let packet = build_iperf_udp_packet(7, 1200);
+        let header = parse_iperf_udp_header(&packet).expect("header should parse");
         assert_eq!(header.sequence, 7);
     }
 
     #[test]
     fn tracks_loss_and_order() {
         let mut metrics = UdpReceiveMetrics::default();
-        for seq in [1_u64, 2, 4, 3, 5] {
-            let packet = build_packet(seq, 128);
-            metrics.on_packet(parse_header(&packet));
+        for seq in [1_u32, 2, 4, 3, 5] {
+            let packet = build_iperf_udp_packet(seq, 64);
+            metrics.on_packet(parse_iperf_udp_header(&packet));
         }
 
         assert_eq!(metrics.total_packets, 5);

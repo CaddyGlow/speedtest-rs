@@ -1,0 +1,612 @@
+{
+  "source_url": "https://iperf.fr/iperf-servers.php",
+  "generated_at_utc": "2026-02-22T13:08:24+00:00",
+  "total_servers": 32,
+  "servers": [
+    {
+      "region": "Europe",
+      "host": "ping.online.net",
+      "localization": "France \u00cele-de-France",
+      "data_center": "Scaleway Vitry DC3",
+      "hosting": "online.net",
+      "speed": "100 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 or IPv6",
+      "contact": "mikmak",
+      "contact_link": "https://lafibre.info/iperf/online-iperf/msg180514/#msg180514",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ping6.online.net",
+      "localization": "France \u00cele-de-France",
+      "data_center": "Scaleway Vitry DC3",
+      "hosting": "online.net",
+      "speed": "100 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 or IPv6",
+      "contact": "mikmak",
+      "contact_link": "https://lafibre.info/iperf/online-iperf/msg180514/#msg180514",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ping-90ms.online.net",
+      "localization": "France \u00cele-de-France",
+      "data_center": "Scaleway Vitry DC3",
+      "hosting": "online.net",
+      "speed": "100 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 or IPv6",
+      "contact": "mikmak",
+      "contact_link": "https://lafibre.info/iperf/online-iperf/msg180514/#msg180514",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ping6-90ms.online.net",
+      "localization": "France \u00cele-de-France",
+      "data_center": "Scaleway Vitry DC3",
+      "hosting": "online.net",
+      "speed": "100 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 or IPv6",
+      "contact": "mikmak",
+      "contact_link": "https://lafibre.info/iperf/online-iperf/msg180514/#msg180514",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "iperf3.moji.fr",
+      "localization": "France \u00cele-de-France",
+      "data_center": "DC Moji",
+      "hosting": "Moji",
+      "speed": "100 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 5200,
+        "to": 5240,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@nemavdotio",
+      "contact_link": "https://twitter.com/nemavdotio",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "speedtest.milkywan.fr",
+      "localization": "France \u00cele-de-France",
+      "data_center": "CBO Croissy-Beaubourg",
+      "hosting": "MilkyWan",
+      "speed": "40 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@huguesdelamure",
+      "contact_link": "https://x.com/huguesdelamure",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "iperf.par2.as49434.net",
+      "localization": "France \u00cele-de-France",
+      "data_center": "DC Harmony Hosting",
+      "hosting": "Harmony Hosting",
+      "speed": "40 Gbit/s",
+      "tcp_congestion_control": null,
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@g_marsot",
+      "contact_link": "https://twitter.com/g_marsot",
+      "status": "OOS",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "paris.bbr.iperf.bytel.fr",
+      "localization": "France Paris BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "paris.cubic.iperf.bytel.fr",
+      "localization": "France Paris Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "mrs.bbr.iperf.bytel.fr",
+      "localization": "France Marseille BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "mrs.cubic.iperf.bytel.fr",
+      "localization": "France Marseille Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "lyo.bbr.iperf.bytel.fr",
+      "localization": "France Lyon BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "lyo.cubic.iperf.bytel.fr",
+      "localization": "France Lyon Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "tls.bbr.iperf.bytel.fr",
+      "localization": "France Toulouse BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "tls.cubic.iperf.bytel.fr",
+      "localization": "France Toulouse Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "str.bbr.iperf.bytel.fr",
+      "localization": "France Strasbourg BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "str.cubic.iperf.bytel.fr",
+      "localization": "France Strasbourg Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "poi.bbr.iperf.bytel.fr",
+      "localization": "France Poitiers BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "poi.cubic.iperf.bytel.fr",
+      "localization": "France Poitiers Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ren.bbr.iperf.bytel.fr",
+      "localization": "France Rennes BBR",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ren.cubic.iperf.bytel.fr",
+      "localization": "France Rennes Cubic",
+      "data_center": "Data centers Bouygues Telecom",
+      "hosting": "Bouygues Telecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@lafibre.info",
+      "contact_link": "https://bsky.app/profile/lafibre.info",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "speedtest.serverius.net",
+      "localization": "Netherlands",
+      "data_center": "Serverius data center",
+      "hosting": "Serverius datacenters",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "port": 5002,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@serveriusbv",
+      "contact_link": "https://twitter.com/serveriusbv",
+      "status": "OK",
+      "test_date": "03/2025",
+      "note": "(Port 5002: add -p 5002 )"
+    },
+    {
+      "region": "Europe",
+      "host": "nl.iperf.014.fr",
+      "localization": "Netherlands",
+      "data_center": "NextGenWebs data center",
+      "hosting": "014.fr",
+      "speed": "1 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 10415,
+        "to": 10420,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 only",
+      "contact": "@014_fr",
+      "contact_link": "https://twitter.com/014_fr",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "ch.iperf.014.fr",
+      "localization": "Switzerland Zurich",
+      "data_center": "HostHatch data center",
+      "hosting": "014.fr",
+      "speed": "3 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 15315,
+        "to": 15320,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 only",
+      "contact": "@014_fr",
+      "contact_link": "https://twitter.com/014_fr",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "iperf.eenet.ee",
+      "localization": "Estonia",
+      "data_center": "EENet Tartu",
+      "hosting": "EENet",
+      "speed": null,
+      "tcp_congestion_control": null,
+      "port": {
+        "port": 5201,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 only",
+      "contact": "@EENet_HITSA",
+      "contact_link": "https://twitter.com/EENet_HITSA",
+      "status": "OOS",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "iperf.astra.in.ua",
+      "localization": "Ukraine Lviv",
+      "data_center": "Astra Lviv",
+      "hosting": "\u0410\u0441\u0442\u0440\u0430",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": null,
+      "port": {
+        "from": 5201,
+        "to": 5206,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "noc@astra.in.ua",
+      "contact_link": null,
+      "status": "OOS",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Europe",
+      "host": "iperf.volia.net",
+      "localization": "Ukraine",
+      "data_center": "Volia Kiev",
+      "hosting": "\u0412\u041e\u041b\u042f",
+      "speed": null,
+      "tcp_congestion_control": "BBR",
+      "port": {
+        "port": 5201,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 only",
+      "contact": "@voliaofficial",
+      "contact_link": "https://twitter.com/voliaofficial",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Africa",
+      "host": "iperf.angolacables.co.ao",
+      "localization": "Angola Luanda",
+      "data_center": "AngoNAP Luanda",
+      "hosting": "Angola Cables",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "Cubic",
+      "port": {
+        "from": 9200,
+        "to": 9240,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "contact",
+      "contact_link": "mailto:sd.ip@angolacables.co.ao",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Asia",
+      "host": "speedtest.uztelecom.uz",
+      "localization": "Uzbekistan Tashkent",
+      "data_center": "Infosystems",
+      "hosting": "Uztelecom",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": "HTCP",
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "@KhurshidSuyunov",
+      "contact_link": "https://twitter.com/KhurshidSuyunov",
+      "status": "OK",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Asia",
+      "host": "iperf.biznetnetworks.com",
+      "localization": "Indonesia",
+      "data_center": "Biznet - Midplaza Cimanggis",
+      "hosting": "Biznet Networks",
+      "speed": "1 Gbit/s",
+      "tcp_congestion_control": null,
+      "port": {
+        "from": 5201,
+        "to": 5203,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "Biznet Networks",
+      "contact_link": "http://www.biznetnetworks.com/",
+      "status": "OOS",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Oceania",
+      "host": "speedtest-iperf-akl.vetta.online",
+      "localization": "New Zealand Auckland",
+      "data_center": "Vetta Online Auckland",
+      "hosting": "Vetta Online",
+      "speed": "10 Gbit/s",
+      "tcp_congestion_control": null,
+      "port": {
+        "from": 5200,
+        "to": 5209,
+        "protocol": "TCP"
+      },
+      "ip_version": "IPv4 only",
+      "contact": "contact",
+      "contact_link": "https://www.vetta.online/contact/",
+      "status": "OOS",
+      "test_date": "03/2025"
+    },
+    {
+      "region": "Americas",
+      "host": "iperf.he.net",
+      "localization": "USA California",
+      "data_center": "Hurricane Fremont 1",
+      "hosting": "he.net",
+      "speed": null,
+      "tcp_congestion_control": null,
+      "port": {
+        "port": 5201,
+        "protocol": "TCP/UDP"
+      },
+      "ip_version": "IPv4 and IPv6",
+      "contact": "HE forums",
+      "contact_link": "https://forums.he.net/",
+      "status": "busy",
+      "test_date": "03/2025"
+    }
+  ]
+}

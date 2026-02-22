@@ -1,7 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,14 +14,19 @@ fn binary_path() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn iperf_tcp_direct_upload_json_smoke() {
-    let (target_port, target_handle, target_bytes) = start_tcp_sink_server().await;
+    if !iperf3_available() {
+        return;
+    }
+
+    let port = reserve_tcp_port();
+    let mut server = start_iperf3_server(port);
 
     let output = run_iperf_command(&[
         "iperf",
         "--host",
         "127.0.0.1",
         "--port",
-        &target_port.to_string(),
+        &port.to_string(),
         "--seconds",
         "1",
         "--parallel",
@@ -32,19 +36,23 @@ async fn iperf_tcp_direct_upload_json_smoke() {
     ])
     .await;
 
-    target_handle.abort();
+    let _ = server.wait();
 
     assert!(output.status.success(), "command failed: {:?}", output);
 
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["schema"], "tunmux.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
-    assert!(target_bytes.load(Ordering::Relaxed) > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn iperf_tcp_http_proxy_upload_json_smoke() {
-    let (target_port, target_handle, target_bytes) = start_tcp_sink_server().await;
+    if !iperf3_available() {
+        return;
+    }
+
+    let port = reserve_tcp_port();
+    let mut server = start_iperf3_server(port);
     let (proxy_port, proxy_handle) = start_http_connect_proxy().await;
 
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
@@ -53,7 +61,7 @@ async fn iperf_tcp_http_proxy_upload_json_smoke() {
         "--host",
         "127.0.0.1",
         "--port",
-        &target_port.to_string(),
+        &port.to_string(),
         "--seconds",
         "1",
         "--parallel",
@@ -66,19 +74,22 @@ async fn iperf_tcp_http_proxy_upload_json_smoke() {
     .await;
 
     proxy_handle.abort();
-    target_handle.abort();
+    let _ = server.wait();
 
     assert!(output.status.success(), "command failed: {:?}", output);
-
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["schema"], "tunmux.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
-    assert!(target_bytes.load(Ordering::Relaxed) > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn iperf_udp_socks5_proxy_upload_json_smoke() {
-    let (udp_target_port, udp_target_handle, udp_packets) = start_udp_sink_server().await;
+    if !iperf3_available() {
+        return;
+    }
+
+    let port = reserve_tcp_port();
+    let mut server = start_iperf3_server(port);
     let (proxy_port, proxy_handle) = start_socks5_proxy().await;
 
     let proxy_url = format!("socks5://127.0.0.1:{proxy_port}");
@@ -87,7 +98,7 @@ async fn iperf_udp_socks5_proxy_upload_json_smoke() {
         "--host",
         "127.0.0.1",
         "--port",
-        &udp_target_port.to_string(),
+        &port.to_string(),
         "--protocol",
         "udp",
         "--seconds",
@@ -104,13 +115,13 @@ async fn iperf_udp_socks5_proxy_upload_json_smoke() {
     .await;
 
     proxy_handle.abort();
-    udp_target_handle.abort();
+    let _ = server.wait();
 
     assert!(output.status.success(), "command failed: {:?}", output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["schema"], "tunmux.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
-    assert!(udp_packets.load(Ordering::Relaxed) > 0);
+    assert!(body["results"]["upload"]["packets"].as_u64().unwrap_or(0) > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -149,64 +160,38 @@ async fn run_iperf_command(args: &[&str]) -> std::process::Output {
     .expect("spawn_blocking should complete")
 }
 
-async fn start_tcp_sink_server() -> (u16, JoinHandle<()>, Arc<AtomicU64>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("tcp listener should bind");
-    let port = listener
-        .local_addr()
-        .expect("listener address should resolve")
-        .port();
-    let bytes = Arc::new(AtomicU64::new(0));
-    let bytes_ref = Arc::clone(&bytes);
-
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let bytes_ref = Arc::clone(&bytes_ref);
-            tokio::spawn(async move {
-                let mut buf = [0_u8; 64 * 1024];
-                loop {
-                    match socket.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            bytes_ref.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    });
-
-    (port, handle, bytes)
+fn iperf3_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("iperf3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }
 
-async fn start_udp_sink_server() -> (u16, JoinHandle<()>, Arc<AtomicU64>) {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("udp socket should bind");
-    let port = socket
+fn reserve_tcp_port() -> u16 {
+    let listener =
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("should reserve local port");
+    listener
         .local_addr()
-        .expect("udp address should resolve")
-        .port();
-    let packets = Arc::new(AtomicU64::new(0));
-    let packets_ref = Arc::clone(&packets);
+        .expect("local addr should resolve")
+        .port()
+}
 
-    let handle = tokio::spawn(async move {
-        let mut buf = [0_u8; 4096];
-        loop {
-            if socket.recv_from(&mut buf).await.is_ok() {
-                packets_ref.fetch_add(1, Ordering::Relaxed);
-            } else {
-                break;
-            }
-        }
-    });
+fn start_iperf3_server(port: u16) -> Child {
+    let child = Command::new("iperf3")
+        .args(["-s", "-1", "-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn iperf3 server");
 
-    (port, handle, packets)
+    std::thread::sleep(Duration::from_millis(300));
+    child
 }
 
 async fn start_http_connect_proxy() -> (u16, JoinHandle<()>) {
@@ -322,19 +307,32 @@ async fn handle_socks5_client(mut control: TcpStream) -> anyhow::Result<()> {
             let relay_addr = relay.local_addr()?;
             write_socks_success(&mut control, relay_addr).await?;
 
+            let mut client_addr: Option<SocketAddr> = None;
             let mut buf = vec![0_u8; 64 * 1024];
+
             loop {
-                let received = timeout(Duration::from_secs(10), relay.recv_from(&mut buf)).await;
-                let Ok(Ok((size, _src))) = received else {
+                let received = timeout(Duration::from_secs(15), relay.recv_from(&mut buf)).await;
+                let Ok(Ok((size, src))) = received else {
                     break;
                 };
 
-                if size < 4 || buf[2] != 0x00 {
+                let is_client_frame = if client_addr.is_none() || client_addr == Some(src) {
+                    parse_socks_udp_destination(&buf[..size]).is_some()
+                } else {
+                    false
+                };
+
+                if is_client_frame {
+                    client_addr = Some(src);
+                    if let Some((dest, payload_start)) = parse_socks_udp_destination(&buf[..size]) {
+                        let _ = relay.send_to(&buf[payload_start..size], dest).await;
+                    }
                     continue;
                 }
 
-                if let Some((dest, payload_start)) = parse_socks_udp_destination(&buf[..size]) {
-                    let _ = relay.send_to(&buf[payload_start..size], dest).await;
+                if let Some(client) = client_addr {
+                    let wrapped = wrap_socks_udp_response(src, &buf[..size]);
+                    let _ = relay.send_to(&wrapped, client).await;
                 }
             }
         }
@@ -374,6 +372,16 @@ async fn read_socks_address(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("domain target resolved to no addresses"))
         }
+        0x04 => {
+            let mut addr = [0_u8; 16];
+            stream.read_exact(&mut addr).await?;
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).await?;
+            Ok(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(addr)),
+                u16::from_be_bytes(port),
+            ))
+        }
         _ => anyhow::bail!("unsupported atyp in test SOCKS server: {atyp}"),
     }
 }
@@ -397,7 +405,7 @@ async fn write_socks_success(stream: &mut TcpStream, bind: SocketAddr) -> anyhow
 }
 
 fn parse_socks_udp_destination(packet: &[u8]) -> Option<(SocketAddr, usize)> {
-    if packet.len() < 4 {
+    if packet.len() < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
         return None;
     }
 
@@ -411,12 +419,47 @@ fn parse_socks_udp_destination(packet: &[u8]) -> Option<(SocketAddr, usize)> {
             cursor += 4;
             let port = packet.get(cursor..cursor + 2)?;
             cursor += 2;
-            let addr = SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
-                u16::from_be_bytes([port[0], port[1]]),
-            );
+            Some((
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+                    u16::from_be_bytes([port[0], port[1]]),
+                ),
+                cursor,
+            ))
+        }
+        0x03 => {
+            let len = *packet.get(cursor)? as usize;
+            cursor += 1;
+            let host = packet.get(cursor..cursor + len)?;
+            cursor += len;
+            let port = packet.get(cursor..cursor + 2)?;
+            cursor += 2;
+            let host = std::str::from_utf8(host).ok()?;
+            let port = u16::from_be_bytes([port[0], port[1]]);
+            let addr = format!("{host}:{port}").parse::<SocketAddr>().ok()?;
             Some((addr, cursor))
         }
         _ => None,
     }
+}
+
+fn wrap_socks_udp_response(from: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 32);
+    out.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+    match from {
+        SocketAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+
+    out.extend_from_slice(payload);
+    out
 }

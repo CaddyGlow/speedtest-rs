@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
 
@@ -99,14 +99,35 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("iperf_target")
+        .required(true)
+        .args(["host", "auto_server"])
+))]
 pub struct IperfArgs {
     /// Target iperf host
     #[arg(long)]
-    pub host: String,
+    pub host: Option<String>,
+
+    /// Pick the closest host from iperf3_servers.json by measured latency
+    #[arg(long, conflicts_with = "host")]
+    pub auto_server: bool,
+
+    /// Path to iperf server list JSON (used with --auto-server)
+    #[arg(long, default_value = "iperf3_servers.json")]
+    pub servers_file: String,
 
     /// Target iperf port
-    #[arg(long, default_value_t = 5201)]
-    pub port: u16,
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Number of auto-selected candidates to probe
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    pub candidate_servers: usize,
+
+    /// Latency samples per auto-selected candidate
+    #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
+    pub latency_samples: usize,
 
     /// iperf protocol mode
     #[arg(long, default_value = "tcp")]
@@ -270,6 +291,20 @@ mod tests {
     }
 
     #[test]
+    fn iperf_accepts_auto_server_without_host() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "iperf", "--auto-server"])
+            .expect("iperf auto-server should parse");
+
+        let Some(Command::Iperf(args)) = cli.command else {
+            panic!("expected iperf command");
+        };
+
+        assert!(args.auto_server);
+        assert!(args.host.is_none());
+        assert_eq!(args.servers_file, "iperf3_servers.json");
+    }
+
+    #[test]
     fn iperf_defaults_to_both_directions() {
         let cli = Cli::try_parse_from(["tunmux-speedtest", "iperf", "--host", "127.0.0.1"])
             .expect("iperf should parse");
@@ -280,8 +315,23 @@ mod tests {
 
         assert!(!args.upload_only);
         assert!(!args.download_only);
+        assert_eq!(args.host.as_deref(), Some("127.0.0.1"));
+        assert!(!args.auto_server);
         assert_eq!(args.seconds, 10);
         assert_eq!(args.parallel, 1);
+    }
+
+    #[test]
+    fn rejects_iperf_host_and_auto_server_together() {
+        let parse = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--auto-server",
+        ]);
+
+        assert!(parse.is_err());
     }
 
     #[test]

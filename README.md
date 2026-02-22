@@ -62,7 +62,17 @@ cargo run -- iperf --host 127.0.0.1 --protocol tcp --upload-only
 cargo run -- iperf --host 127.0.0.1 --protocol udp --proxy socks5://127.0.0.1:1080
 cargo run -- iperf --host 127.0.0.1 --protocol tcp --proxy http://127.0.0.1:8080 --download-only
 cargo run -- iperf --host 127.0.0.1 --json
+cargo run -- iperf --auto-server
+cargo run -- iperf --auto-server --servers-file iperf3_servers.json --candidate-servers 12 --latency-samples 2
 ```
+
+Iperf auto-selection mode:
+
+- `--auto-server` picks the closest reachable host by measured TCP control-channel latency
+- server list is read from `iperf3_servers.json` by default
+- `--candidate-servers` limits how many list entries are probed
+- `--latency-samples` controls probe samples per candidate
+- optional `--port` overrides catalog ports during selection
 
 Iperf proxy matrix:
 

@@ -312,7 +312,6 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
     let render_ui = !args.json;
     let mut ui = ui::Ui::new(args.tui, render_ui);
     ui.render_phase("preparing native iperf client");
-    ui.render_metric("target", &format!("{}:{}", args.host, args.port));
     ui.render_metric(
         "protocol",
         match args.protocol {
@@ -325,9 +324,51 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
         ui.render_metric("proxy", &proxy.raw_url);
     }
 
+    let (target_host, target_port) = if args.auto_server {
+        ui.render_phase("loading iperf server catalog");
+        let mut candidates =
+            iperf::servers::load_candidates(&args.servers_file, args.protocol, args.port)?;
+        let limit = args.candidate_servers.min(candidates.len());
+        candidates.truncate(limit);
+
+        ui.render_metric("catalog", &args.servers_file);
+        ui.render_metric("candidates", &limit.to_string());
+        ui.render_phase("probing iperf latency across candidates");
+
+        let selected = with_ctrl_c(iperf::servers::select_best_server(
+            &candidates,
+            args.latency_samples,
+            proxy_spec.as_ref(),
+        ))
+        .await?;
+
+        let mut label = format!(
+            "{}:{} {:.2}ms",
+            selected.host, selected.port, selected.average_latency_ms
+        );
+        if let Some(region) = selected.region.as_deref() {
+            label.push_str(&format!(" [{region}]"));
+        }
+        if let Some(localization) = selected.localization.as_deref() {
+            label.push_str(&format!(" {localization}"));
+        }
+        ui.render_metric("selected_server", &label);
+
+        (selected.host, selected.port)
+    } else {
+        let host = args
+            .host
+            .clone()
+            .context("--host is required unless --auto-server is set")?;
+        let port = args.port.unwrap_or(5201);
+        (host, port)
+    };
+
+    ui.render_metric("target", &format!("{}:{}", target_host, target_port));
+
     let config = iperf::IperfClientConfig {
-        host: args.host.clone(),
-        port: args.port,
+        host: target_host.clone(),
+        port: target_port,
         protocol: args.protocol,
         seconds: args.seconds,
         parallel: args.parallel,
@@ -398,8 +439,8 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
         schema: IPERF_SCHEMA_V1.to_string(),
         timestamp: current_timestamp()?,
         target: IperfTarget {
-            host: args.host,
-            port: args.port,
+            host: target_host,
+            port: target_port,
         },
         protocol: match args.protocol {
             IperfProtocol::Tcp => IperfProtocolOut::Tcp,
