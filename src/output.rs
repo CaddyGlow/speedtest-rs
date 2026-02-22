@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::iperf::schema::{IperfDirectionOut, IperfJsonV1, IperfProtocolOut};
 use crate::model::RunResult;
 
 pub fn print_human(result: &RunResult) {
@@ -43,4 +44,68 @@ pub fn print_json(result: &RunResult) -> Result<()> {
     let body = serde_json::to_string_pretty(result)?;
     println!("{}", body);
     Ok(())
+}
+
+pub fn print_iperf_human(result: &IperfJsonV1) {
+    let protocol = match result.protocol {
+        IperfProtocolOut::Tcp => "tcp",
+        IperfProtocolOut::Udp => "udp",
+    };
+
+    println!("schema: {}", result.schema);
+    println!("timestamp: {}", result.timestamp);
+    println!(
+        "target: {}:{} protocol={}",
+        result.target.host, result.target.port, protocol
+    );
+
+    if let Some(proxy) = &result.proxy {
+        println!("proxy: {} ({})", proxy.url, proxy.scheme);
+    } else {
+        println!("proxy: none");
+    }
+
+    println!(
+        "config: seconds={} parallel={} bitrate_bps={}",
+        result.config.seconds,
+        result.config.parallel,
+        result
+            .config
+            .bitrate_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    print_iperf_direction("upload", result.results.upload.as_ref());
+    print_iperf_direction("download", result.results.download.as_ref());
+}
+
+pub fn print_iperf_json(result: &IperfJsonV1) -> Result<()> {
+    let body = serde_json::to_string_pretty(result)?;
+    println!("{}", body);
+    Ok(())
+}
+
+fn print_iperf_direction(label: &str, result: Option<&IperfDirectionOut>) {
+    let Some(result) = result else {
+        println!("{}: skipped", label);
+        return;
+    };
+
+    println!(
+        "{}: {:.2} Mbps (bytes={} duration={}s)",
+        label, result.mbps, result.bytes, result.duration_seconds
+    );
+
+    if let Some(packets) = result.packets {
+        println!(
+            "{} udp: packets={} lost={:?} loss_percent={:?} jitter_ms={:?} out_of_order={:?}",
+            label,
+            packets,
+            result.lost_packets,
+            result.loss_percent,
+            result.jitter_ms,
+            result.out_of_order
+        );
+    }
 }

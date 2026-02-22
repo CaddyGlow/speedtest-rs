@@ -1,9 +1,17 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TuiMode {
     Compact,
     Fullscreen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum IperfProtocol {
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -90,8 +98,56 @@ pub struct RunArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct IperfArgs {
+    /// Target iperf host
+    #[arg(long)]
+    pub host: String,
+
+    /// Target iperf port
+    #[arg(long, default_value_t = 5201)]
+    pub port: u16,
+
+    /// iperf protocol mode
+    #[arg(long, default_value = "tcp")]
+    pub protocol: IperfProtocol,
+
+    /// Test duration in seconds
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_u64)]
+    pub seconds: u64,
+
+    /// Parallel worker streams
+    #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+    pub parallel: usize,
+
+    /// Optional target bitrate in bits per second (mainly for UDP)
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub bitrate: Option<u64>,
+
+    /// Optional HTTP/SOCKS5 proxy URL
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Skip download direction
+    #[arg(long, conflicts_with = "download_only")]
+    pub upload_only: bool,
+
+    /// Skip upload direction
+    #[arg(long, conflicts_with = "upload_only")]
+    pub download_only: bool,
+
+    /// TUI mode
+    #[arg(long, default_value = "compact")]
+    pub tui: TuiMode,
+
+    /// Emit machine-readable JSON result
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "tunmux-speedtest")]
+#[command(version = APP_VERSION)]
 #[command(about = "Standalone Speedtest.net CLI/TUI")]
 pub struct Cli {
     #[command(subcommand)]
@@ -102,6 +158,9 @@ pub struct Cli {
 pub enum Command {
     /// Run speed test flow
     Run(RunArgs),
+
+    /// Run native iperf benchmark flow
+    Iperf(IperfArgs),
 
     /// Manage local speedtest server cache
     Cache(CacheArgs),
@@ -187,6 +246,42 @@ mod tests {
     fn defaults_to_run_command() {
         let cli = Cli::default();
         assert!(matches!(cli.command, Some(Command::Run(_))));
+    }
+
+    #[test]
+    fn rejects_iperf_upload_only_and_download_only_together() {
+        let parse = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--upload-only",
+            "--download-only",
+        ]);
+
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn iperf_requires_host() {
+        let parse = Cli::try_parse_from(["tunmux-speedtest", "iperf"]);
+
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn iperf_defaults_to_both_directions() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "iperf", "--host", "127.0.0.1"])
+            .expect("iperf should parse");
+
+        let Some(Command::Iperf(args)) = cli.command else {
+            panic!("expected iperf command");
+        };
+
+        assert!(!args.upload_only);
+        assert!(!args.download_only);
+        assert_eq!(args.seconds, 10);
+        assert_eq!(args.parallel, 1);
     }
 
     #[test]

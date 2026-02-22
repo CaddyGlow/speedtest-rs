@@ -9,6 +9,7 @@ It is intentionally separate from the `tunmux` workspace and has no dependency o
 - best server auto selection by measured latency
 - configurable parallel download and upload workers
 - proxy support: HTTP, HTTPS, SOCKS5, SOCKS5h
+- native `iperf` command with dedicated JSON schema (`tunmux.iperf.v1`)
 - compact TUI and fullscreen TUI modes
 - human readable and JSON output
 
@@ -52,6 +53,23 @@ cargo run -- run --proxy socks5h://127.0.0.1:1080
 cargo run -- run --download-connections 8 --upload-connections 6
 cargo run -- run --json
 ```
+
+Native iperf command examples:
+
+```bash
+cargo run -- iperf --host 127.0.0.1
+cargo run -- iperf --host 127.0.0.1 --protocol tcp --upload-only
+cargo run -- iperf --host 127.0.0.1 --protocol udp --proxy socks5://127.0.0.1:1080
+cargo run -- iperf --host 127.0.0.1 --protocol tcp --proxy http://127.0.0.1:8080 --download-only
+cargo run -- iperf --host 127.0.0.1 --json
+```
+
+Iperf proxy matrix:
+
+- TCP: direct, HTTP proxy, SOCKS5/SOCKS5h proxy
+- UDP: direct, SOCKS5/SOCKS5h proxy
+- UDP over HTTP is rejected
+- HTTPS proxy is currently rejected for the native iperf command
 
 Cache helpers:
 

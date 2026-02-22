@@ -3,8 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::cli::{CacheCommand, Cli, Command, RunArgs};
+use crate::cli::{CacheCommand, Cli, Command, IperfArgs, IperfProtocol, RunArgs};
 use crate::http;
+use crate::iperf;
+use crate::iperf::schema::{
+    IPERF_SCHEMA_V1, IperfConfigOut, IperfDirectionOut, IperfJsonV1, IperfProtocolOut,
+    IperfProxyOut, IperfResultsOut, IperfTarget,
+};
 use crate::model::{BenchmarkResult, ClientMeta, RunResult, Server};
 use crate::output;
 use crate::speedtest;
@@ -23,6 +28,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Cache(cache) => run_cache_command(cache.command),
         Command::Run(args) => run_speedtest(args).await,
+        Command::Iperf(args) => run_iperf(args).await,
     }
 }
 
@@ -294,13 +300,139 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_iperf(args: IperfArgs) -> Result<()> {
+    let proxy_spec = args
+        .proxy
+        .as_deref()
+        .map(iperf::proxy::parse_proxy)
+        .transpose()?;
+
+    iperf::proxy::ensure_compatible(args.protocol, proxy_spec.as_ref())?;
+
+    let render_ui = !args.json;
+    let mut ui = ui::Ui::new(args.tui, render_ui);
+    ui.render_phase("preparing native iperf client");
+    ui.render_metric("target", &format!("{}:{}", args.host, args.port));
+    ui.render_metric(
+        "protocol",
+        match args.protocol {
+            IperfProtocol::Tcp => "tcp",
+            IperfProtocol::Udp => "udp",
+        },
+    );
+    ui.render_metric("parallel", &args.parallel.to_string());
+    if let Some(proxy) = proxy_spec.as_ref() {
+        ui.render_metric("proxy", &proxy.raw_url);
+    }
+
+    let config = iperf::IperfClientConfig {
+        host: args.host.clone(),
+        port: args.port,
+        protocol: args.protocol,
+        seconds: args.seconds,
+        parallel: args.parallel,
+        bitrate_bps: args.bitrate,
+        proxy: proxy_spec.clone(),
+    };
+
+    let directions = if args.upload_only {
+        vec![iperf::IperfDirection::Upload]
+    } else if args.download_only {
+        vec![iperf::IperfDirection::Download]
+    } else {
+        vec![
+            iperf::IperfDirection::Upload,
+            iperf::IperfDirection::Download,
+        ]
+    };
+
+    let mut upload = None;
+    let mut download = None;
+
+    for direction in directions {
+        let phase = direction.label();
+        ui.render_phase(&format!("running iperf {phase}"));
+        let progress_interval = ui.progress_interval();
+        let mut progress = Some(ui.begin_speed_progress(phase, args.seconds));
+        let stats = with_ctrl_c(iperf::run_direction(
+            &config,
+            direction,
+            progress_interval,
+            |snapshot| {
+                if let Some(progress) = progress.as_ref() {
+                    ui.update_speed_progress(
+                        progress,
+                        snapshot.elapsed,
+                        snapshot.mbps,
+                        snapshot.bytes,
+                    );
+                }
+            },
+        ))
+        .await?;
+
+        if let Some(progress) = progress.take() {
+            ui.finish_speed_progress(progress, phase, stats.mbps, stats.bytes);
+        }
+
+        let out = IperfDirectionOut {
+            bytes: stats.bytes,
+            mbps: stats.mbps,
+            duration_seconds: stats.duration_seconds,
+            packets: stats.packets,
+            lost_packets: stats.lost_packets,
+            loss_percent: stats.loss_percent,
+            jitter_ms: stats.jitter_ms,
+            out_of_order: stats.out_of_order,
+        };
+
+        match direction {
+            iperf::IperfDirection::Upload => upload = Some(out),
+            iperf::IperfDirection::Download => download = Some(out),
+        }
+    }
+
+    ui.shutdown();
+
+    let result = IperfJsonV1 {
+        schema: IPERF_SCHEMA_V1.to_string(),
+        timestamp: current_timestamp()?,
+        target: IperfTarget {
+            host: args.host,
+            port: args.port,
+        },
+        protocol: match args.protocol {
+            IperfProtocol::Tcp => IperfProtocolOut::Tcp,
+            IperfProtocol::Udp => IperfProtocolOut::Udp,
+        },
+        proxy: proxy_spec.as_ref().map(|proxy| IperfProxyOut {
+            url: proxy.raw_url.clone(),
+            scheme: proxy.scheme.as_str().to_string(),
+        }),
+        config: IperfConfigOut {
+            seconds: args.seconds,
+            parallel: args.parallel,
+            bitrate_bps: args.bitrate,
+        },
+        results: IperfResultsOut { upload, download },
+    };
+
+    if args.json {
+        output::print_iperf_json(&result)?;
+    } else {
+        output::print_iperf_human(&result);
+    }
+
+    Ok(())
+}
+
 async fn with_ctrl_c<F, T>(future: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
     tokio::select! {
         output = future => output,
-        _ = tokio::signal::ctrl_c() => bail!("speedtest interrupted by Ctrl-C"),
+        _ = tokio::signal::ctrl_c() => bail!("benchmark interrupted by Ctrl-C"),
     }
 }
 

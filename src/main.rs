@@ -1,6 +1,7 @@
 mod cli;
 mod error;
 mod http;
+mod iperf;
 mod model;
 mod output;
 mod runner;
