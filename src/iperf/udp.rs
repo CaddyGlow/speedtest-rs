@@ -60,12 +60,14 @@ where
                     run_udp_worker_loop(
                         direction,
                         stop_at,
-                        packet_size,
-                        &mut next_sequence,
-                        sleep_between_packets,
-                        &mut recv_buffer,
-                        &mut result,
                         UdpSendRecv::Direct(socket),
+                        WorkerLoopState {
+                            packet_size,
+                            next_sequence: &mut next_sequence,
+                            sleep_between_packets,
+                            recv_buffer: &mut recv_buffer,
+                            result: &mut result,
+                        },
                     )
                     .await;
                 }
@@ -84,12 +86,14 @@ where
                     run_udp_worker_loop(
                         direction,
                         stop_at,
-                        packet_size,
-                        &mut next_sequence,
-                        sleep_between_packets,
-                        &mut recv_buffer,
-                        &mut result,
                         UdpSendRecv::Socks(association),
+                        WorkerLoopState {
+                            packet_size,
+                            next_sequence: &mut next_sequence,
+                            sleep_between_packets,
+                            recv_buffer: &mut recv_buffer,
+                            result: &mut result,
+                        },
                     )
                     .await;
                 }
@@ -180,13 +184,17 @@ enum UdpSendRecv {
 async fn run_udp_worker_loop(
     direction: IperfDirection,
     stop_at: Instant,
-    packet_size: usize,
-    next_sequence: &mut u64,
-    sleep_between_packets: Option<Duration>,
-    recv_buffer: &mut [u8],
-    result: &mut WorkerUdpResult,
     mut transport: UdpSendRecv,
+    state: WorkerLoopState<'_>,
 ) {
+    let WorkerLoopState {
+        packet_size,
+        next_sequence,
+        sleep_between_packets,
+        recv_buffer,
+        result,
+    } = state;
+
     while Instant::now() < stop_at {
         let io_result = match direction {
             IperfDirection::Upload => {
@@ -212,6 +220,14 @@ async fn run_udp_worker_loop(
             sleep(delay).await;
         }
     }
+}
+
+struct WorkerLoopState<'a> {
+    packet_size: usize,
+    next_sequence: &'a mut u64,
+    sleep_between_packets: Option<Duration>,
+    recv_buffer: &'a mut [u8],
+    result: &'a mut WorkerUdpResult,
 }
 
 async fn udp_send(transport: &mut UdpSendRecv, payload: &[u8]) -> Result<usize> {
