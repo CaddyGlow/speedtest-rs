@@ -109,7 +109,9 @@ where
     let reverse = matches!(direction, IperfDirection::Download);
 
     loop {
-        let state = read_state(&mut control).await?;
+        let state = timeout(Duration::from_secs(10), read_state(&mut control))
+            .await
+            .context("timed out waiting for iperf3 setup control state")??;
         match state {
             PARAM_EXCHANGE => {
                 let params = build_parameters_json(
@@ -157,25 +159,46 @@ where
     )
     .await?;
 
-    write_state(&mut control, TEST_END).await?;
+    timeout(Duration::from_secs(4), write_state(&mut control, TEST_END))
+        .await
+        .context("timed out sending TEST_END to iperf3 control channel")??;
 
     let mut remote: Option<RemoteResults> = None;
     let mut saw_done = false;
 
     while !saw_done {
-        let state = match read_state(&mut control).await {
-            Ok(state) => state,
+        let state = match timeout(Duration::from_secs(4), read_state(&mut control)).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(_)) => break,
             Err(_) => break,
         };
         match state {
             EXCHANGE_RESULTS => {
                 let local_payload = build_results_json(&local_streams, seconds);
-                write_json_frame(&mut control, &local_payload).await?;
-                let remote_json = read_json_frame(&mut control, None).await?;
+                timeout(
+                    Duration::from_secs(4),
+                    write_json_frame(&mut control, &local_payload),
+                )
+                .await
+                .context("timed out sending local iperf3 results")??;
+
+                let remote_json = match timeout(
+                    Duration::from_secs(4),
+                    read_json_frame(&mut control, None),
+                )
+                .await
+                {
+                    Ok(Ok(payload)) => payload,
+                    Ok(Err(_)) | Err(_) => break,
+                };
                 remote = Some(parse_remote_results(&remote_json));
             }
             DISPLAY_RESULTS => {
-                let _ = write_state(&mut control, IPERF_DONE).await;
+                let _ = timeout(
+                    Duration::from_secs(2),
+                    write_state(&mut control, IPERF_DONE),
+                )
+                .await;
             }
             IPERF_DONE => saw_done = true,
             SERVER_ERROR => return Err(read_server_error(&mut control).await),
