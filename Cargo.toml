@@ -1,0 +1,20 @@
+[package]
+name = "tunmux-speedtest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Standalone Speedtest.net CLI/TUI with proxy support"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+indicatif = "0.17"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "socks"] }
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+url = "2"
