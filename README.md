@@ -52,6 +52,7 @@ cargo run -- run --tui fullscreen
 cargo run -- run --proxy socks5h://127.0.0.1:1080
 cargo run -- run --download-connections 8 --upload-connections 6
 cargo run -- run --json
+cargo run -- run --json --details
 ```
 
 Native iperf command examples:
@@ -62,6 +63,7 @@ cargo run -- iperf --host 127.0.0.1 --protocol tcp --upload-only
 cargo run -- iperf --host 127.0.0.1 --protocol udp --proxy socks5://127.0.0.1:1080
 cargo run -- iperf --host 127.0.0.1 --protocol tcp --proxy http://127.0.0.1:8080 --download-only
 cargo run -- iperf --host 127.0.0.1 --json
+cargo run -- iperf --host 127.0.0.1 --json --details
 cargo run -- iperf --auto-server
 cargo run -- iperf --auto-server --servers-file iperf3_servers.json --candidate-servers 12 --latency-samples 2
 ```

@@ -13,6 +13,11 @@ use crate::util::{clamp_worker_count, mbps_from_bytes};
 pub struct UploadStats {
     pub bytes: u64,
     pub mbps: f64,
+    pub request_attempts: u64,
+    pub request_successes: u64,
+    pub request_http_errors: u64,
+    pub request_transport_errors: u64,
+    pub response_read_errors: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +42,11 @@ where
     let start_at = Instant::now();
     let stop_at = start_at + Duration::from_secs(seconds);
     let total_bytes = Arc::new(AtomicU64::new(0));
+    let request_attempts = Arc::new(AtomicU64::new(0));
+    let request_successes = Arc::new(AtomicU64::new(0));
+    let request_http_errors = Arc::new(AtomicU64::new(0));
+    let request_transport_errors = Arc::new(AtomicU64::new(0));
+    let response_read_errors = Arc::new(AtomicU64::new(0));
     let payload = Arc::new(vec![0x42_u8; 256 * 1024]);
 
     let upload_url = server.upload_url()?;
@@ -46,9 +56,15 @@ where
         let worker_upload_url = upload_url.clone();
         let worker_payload = Arc::clone(&payload);
         let worker_bytes = Arc::clone(&total_bytes);
+        let worker_attempts = Arc::clone(&request_attempts);
+        let worker_successes = Arc::clone(&request_successes);
+        let worker_http_errors = Arc::clone(&request_http_errors);
+        let worker_transport_errors = Arc::clone(&request_transport_errors);
+        let worker_read_errors = Arc::clone(&response_read_errors);
 
         tasks.spawn(async move {
             while Instant::now() < stop_at {
+                worker_attempts.fetch_add(1, Ordering::Relaxed);
                 let response = match worker_client
                     .post(&worker_upload_url)
                     .header("Content-Type", "application/octet-stream")
@@ -58,13 +74,25 @@ where
                 {
                     Ok(response) => match response.error_for_status() {
                         Ok(response) => response,
-                        Err(_) => continue,
+                        Err(_) => {
+                            worker_http_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     },
-                    Err(_) => continue,
+                    Err(_) => {
+                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
 
-                if response.bytes().await.is_ok() {
-                    worker_bytes.fetch_add(worker_payload.len() as u64, Ordering::Relaxed);
+                match response.bytes().await {
+                    Ok(_) => {
+                        worker_successes.fetch_add(1, Ordering::Relaxed);
+                        worker_bytes.fetch_add(worker_payload.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -90,5 +118,10 @@ where
     Ok(UploadStats {
         bytes,
         mbps: mbps_from_bytes(bytes, seconds),
+        request_attempts: request_attempts.load(Ordering::Relaxed),
+        request_successes: request_successes.load(Ordering::Relaxed),
+        request_http_errors: request_http_errors.load(Ordering::Relaxed),
+        request_transport_errors: request_transport_errors.load(Ordering::Relaxed),
+        response_read_errors: response_read_errors.load(Ordering::Relaxed),
     })
 }

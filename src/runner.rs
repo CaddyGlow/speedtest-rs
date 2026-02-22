@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -7,10 +7,14 @@ use crate::cli::{CacheCommand, Cli, Command, IperfArgs, IperfProtocol, RunArgs};
 use crate::http;
 use crate::iperf;
 use crate::iperf::schema::{
-    IPERF_SCHEMA_V1, IperfConfigOut, IperfDirectionOut, IperfJsonV1, IperfProtocolOut,
-    IperfProxyOut, IperfResultsOut, IperfTarget,
+    IPERF_SCHEMA_V1, IperfConfigOut, IperfDetailsOut, IperfDirectionDetailsOut, IperfDirectionOut,
+    IperfIntervalOut, IperfIntervalResultsOut, IperfJsonV1, IperfProtocolOut, IperfProxyOut,
+    IperfResultsOut, IperfTarget,
 };
-use crate::model::{BenchmarkResult, ClientMeta, RunResult, Server};
+use crate::model::{
+    BenchmarkResult, ClientMeta, DirectionDetails, RunDetails, RunResult,
+    SelectedServerLatencyDetails, Server, ThroughputInterval,
+};
 use crate::output;
 use crate::speedtest;
 use crate::ui;
@@ -119,6 +123,10 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
     let mut effective_args = args.clone();
     effective_args.download_connections = clamp_worker_count(effective_args.download_connections);
     effective_args.upload_connections = clamp_worker_count(effective_args.upload_connections);
+    let details_interval_seconds = 1_u64;
+    let details_progress_interval = effective_args
+        .details
+        .then_some(Duration::from_secs(details_interval_seconds));
     let render_ui = !effective_args.json;
     let mut ui = ui::Ui::new(effective_args.tui, render_ui);
 
@@ -192,12 +200,13 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
         ),
     );
 
-    let download = if effective_args.upload_only {
-        None
+    let (download, download_details) = if effective_args.upload_only {
+        (None, None)
     } else {
-        let progress_interval = ui.progress_interval();
+        let progress_interval = details_progress_interval.or_else(|| ui.progress_interval());
         let mut progress =
             Some(ui.begin_speed_progress("download", effective_args.download_seconds));
+        let mut intervals = Vec::new();
         let stats = with_ctrl_c(speedtest::download::run_download_test(
             &client,
             &selected.server,
@@ -213,27 +222,58 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
                         snapshot.bytes,
                     );
                 }
+                if effective_args.details {
+                    push_run_interval(
+                        &mut intervals,
+                        snapshot
+                            .elapsed
+                            .as_secs_f64()
+                            .min(effective_args.download_seconds as f64),
+                        snapshot.bytes,
+                        snapshot.mbps,
+                    );
+                }
             },
         ))
         .await?;
+
+        if effective_args.details {
+            push_run_interval(
+                &mut intervals,
+                effective_args.download_seconds as f64,
+                stats.bytes,
+                stats.mbps,
+            );
+        }
 
         if let Some(progress) = progress.take() {
             ui.finish_speed_progress(progress, "download", stats.mbps, stats.bytes);
         }
 
-        Some(BenchmarkResult {
-            mbps: stats.mbps,
-            bytes: stats.bytes,
-            duration_seconds: effective_args.download_seconds,
-            connections: effective_args.download_connections,
-        })
+        (
+            Some(BenchmarkResult {
+                mbps: stats.mbps,
+                bytes: stats.bytes,
+                duration_seconds: effective_args.download_seconds,
+                connections: effective_args.download_connections,
+            }),
+            effective_args.details.then_some(DirectionDetails {
+                request_attempts: stats.request_attempts,
+                request_successes: stats.request_successes,
+                request_http_errors: stats.request_http_errors,
+                request_transport_errors: stats.request_transport_errors,
+                response_read_errors: stats.response_read_errors,
+                intervals,
+            }),
+        )
     };
 
-    let upload = if effective_args.download_only {
-        None
+    let (upload, upload_details) = if effective_args.download_only {
+        (None, None)
     } else {
-        let progress_interval = ui.progress_interval();
+        let progress_interval = details_progress_interval.or_else(|| ui.progress_interval());
         let mut progress = Some(ui.begin_speed_progress("upload", effective_args.upload_seconds));
+        let mut intervals = Vec::new();
         let stats = with_ctrl_c(speedtest::upload::run_upload_test(
             &client,
             &selected.server,
@@ -249,20 +289,50 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
                         snapshot.bytes,
                     );
                 }
+                if effective_args.details {
+                    push_run_interval(
+                        &mut intervals,
+                        snapshot
+                            .elapsed
+                            .as_secs_f64()
+                            .min(effective_args.upload_seconds as f64),
+                        snapshot.bytes,
+                        snapshot.mbps,
+                    );
+                }
             },
         ))
         .await?;
+
+        if effective_args.details {
+            push_run_interval(
+                &mut intervals,
+                effective_args.upload_seconds as f64,
+                stats.bytes,
+                stats.mbps,
+            );
+        }
 
         if let Some(progress) = progress.take() {
             ui.finish_speed_progress(progress, "upload", stats.mbps, stats.bytes);
         }
 
-        Some(BenchmarkResult {
-            mbps: stats.mbps,
-            bytes: stats.bytes,
-            duration_seconds: effective_args.upload_seconds,
-            connections: effective_args.upload_connections,
-        })
+        (
+            Some(BenchmarkResult {
+                mbps: stats.mbps,
+                bytes: stats.bytes,
+                duration_seconds: effective_args.upload_seconds,
+                connections: effective_args.upload_connections,
+            }),
+            effective_args.details.then_some(DirectionDetails {
+                request_attempts: stats.request_attempts,
+                request_successes: stats.request_successes,
+                request_http_errors: stats.request_http_errors,
+                request_transport_errors: stats.request_transport_errors,
+                response_read_errors: stats.response_read_errors,
+                intervals,
+            }),
+        )
     };
 
     let result = RunResult {
@@ -287,6 +357,15 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
         download,
         upload,
         proxy: effective_args.proxy,
+        details: effective_args.details.then_some(RunDetails {
+            interval_seconds: details_interval_seconds,
+            selected_server_latency: SelectedServerLatencyDetails {
+                average_ms: selected.average_ms,
+                variance_ms: selected.variance_ms,
+            },
+            download: download_details,
+            upload: upload_details,
+        }),
     };
 
     ui.shutdown();
@@ -309,6 +388,10 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
 
     iperf::proxy::ensure_compatible(args.protocol, proxy_spec.as_ref())?;
 
+    let details_interval_seconds = 1_u64;
+    let details_progress_interval = args
+        .details
+        .then_some(Duration::from_secs(details_interval_seconds));
     let render_ui = !args.json;
     let mut ui = ui::Ui::new(args.tui, render_ui);
     ui.render_phase("preparing native iperf client");
@@ -389,12 +472,15 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
 
     let mut upload = None;
     let mut download = None;
+    let mut upload_details = None;
+    let mut download_details = None;
 
     for direction in directions {
         let phase = direction.label();
         ui.render_phase(&format!("running iperf {phase}"));
-        let progress_interval = ui.progress_interval();
+        let progress_interval = details_progress_interval.or_else(|| ui.progress_interval());
         let mut progress = Some(ui.begin_speed_progress(phase, args.seconds));
+        let mut intervals = Vec::new();
         let stats = with_ctrl_c(iperf::run_direction(
             &config,
             direction,
@@ -408,9 +494,21 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
                         snapshot.bytes,
                     );
                 }
+                if args.details {
+                    push_iperf_interval(
+                        &mut intervals,
+                        snapshot.elapsed.as_secs_f64().min(args.seconds as f64),
+                        snapshot.bytes,
+                        snapshot.mbps,
+                    );
+                }
             },
         ))
         .await?;
+
+        if args.details {
+            push_iperf_interval(&mut intervals, args.seconds as f64, stats.bytes, stats.mbps);
+        }
 
         if let Some(progress) = progress.take() {
             ui.finish_speed_progress(progress, phase, stats.mbps, stats.bytes);
@@ -428,8 +526,18 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
         };
 
         match direction {
-            iperf::IperfDirection::Upload => upload = Some(out),
-            iperf::IperfDirection::Download => download = Some(out),
+            iperf::IperfDirection::Upload => {
+                upload = Some(out);
+                upload_details = args
+                    .details
+                    .then_some(IperfDirectionDetailsOut { intervals });
+            }
+            iperf::IperfDirection::Download => {
+                download = Some(out);
+                download_details = args
+                    .details
+                    .then_some(IperfDirectionDetailsOut { intervals });
+            }
         }
     }
 
@@ -456,6 +564,13 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
             bitrate_bps: args.bitrate,
         },
         results: IperfResultsOut { upload, download },
+        details: args.details.then_some(IperfDetailsOut {
+            interval_seconds: details_interval_seconds,
+            results: IperfIntervalResultsOut {
+                upload: upload_details,
+                download: download_details,
+            },
+        }),
     };
 
     if args.json {
@@ -465,6 +580,52 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn push_run_interval(
+    intervals: &mut Vec<ThroughputInterval>,
+    elapsed_seconds: f64,
+    bytes: u64,
+    mbps: f64,
+) {
+    if let Some(last) = intervals.last()
+        && (last.elapsed_seconds - elapsed_seconds).abs() < f64::EPSILON
+    {
+        if let Some(last_mut) = intervals.last_mut() {
+            last_mut.bytes = bytes;
+            last_mut.mbps = mbps;
+        }
+        return;
+    }
+
+    intervals.push(ThroughputInterval {
+        elapsed_seconds,
+        bytes,
+        mbps,
+    });
+}
+
+fn push_iperf_interval(
+    intervals: &mut Vec<IperfIntervalOut>,
+    elapsed_seconds: f64,
+    bytes: u64,
+    mbps: f64,
+) {
+    if let Some(last) = intervals.last()
+        && (last.elapsed_seconds - elapsed_seconds).abs() < f64::EPSILON
+    {
+        if let Some(last_mut) = intervals.last_mut() {
+            last_mut.bytes = bytes;
+            last_mut.mbps = mbps;
+        }
+        return;
+    }
+
+    intervals.push(IperfIntervalOut {
+        elapsed_seconds,
+        bytes,
+        mbps,
+    });
 }
 
 async fn with_ctrl_c<F, T>(future: F) -> Result<T>

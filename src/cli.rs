@@ -66,7 +66,7 @@ pub struct RunArgs {
     pub download_connections: usize,
 
     /// Parallel upload workers
-    #[arg(long, default_value_t = 6, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
     pub upload_connections: usize,
 
     /// Download phase duration in seconds
@@ -96,6 +96,10 @@ pub struct RunArgs {
     /// Emit machine-readable JSON result
     #[arg(long)]
     pub json: bool,
+
+    /// Include interval and diagnostic details in JSON output
+    #[arg(long, requires = "json")]
+    pub details: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -164,6 +168,10 @@ pub struct IperfArgs {
     /// Emit machine-readable JSON result
     #[arg(long)]
     pub json: bool,
+
+    /// Include interval and diagnostic details in JSON output
+    #[arg(long, requires = "json")]
+    pub details: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -198,7 +206,7 @@ impl Default for Cli {
                 candidate_servers: 10,
                 latency_samples: 3,
                 download_connections: 8,
-                upload_connections: 6,
+                upload_connections: 8,
                 download_seconds: 10,
                 upload_seconds: 10,
                 download_only: false,
@@ -206,6 +214,7 @@ impl Default for Cli {
                 proxy: None,
                 tui: TuiMode::Compact,
                 json: false,
+                details: false,
             })),
         }
     }
@@ -264,6 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_run_details_without_json() {
+        let parse = Cli::try_parse_from(["tunmux-speedtest", "run", "--details"]);
+
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn accepts_run_details_with_json() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--json", "--details"])
+            .expect("run --json --details should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(args.json);
+        assert!(args.details);
+    }
+
+    #[test]
     fn defaults_to_run_command() {
         let cli = Cli::default();
         assert!(matches!(cli.command, Some(Command::Run(_))));
@@ -281,6 +310,39 @@ mod tests {
         ]);
 
         assert!(parse.is_err());
+    }
+
+    #[test]
+    fn rejects_iperf_details_without_json() {
+        let parse = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--details",
+        ]);
+
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn accepts_iperf_details_with_json() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--json",
+            "--details",
+        ])
+        .expect("iperf --json --details should parse");
+
+        let Some(Command::Iperf(args)) = cli.command else {
+            panic!("expected iperf command");
+        };
+
+        assert!(args.json);
+        assert!(args.details);
     }
 
     #[test]

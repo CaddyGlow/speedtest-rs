@@ -11,6 +11,8 @@ pub struct IperfJsonV1 {
     pub proxy: Option<IperfProxyOut>,
     pub config: IperfConfigOut,
     pub results: IperfResultsOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<IperfDetailsOut>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,30 @@ pub struct IperfDirectionOut {
     pub out_of_order: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IperfDetailsOut {
+    pub interval_seconds: u64,
+    pub results: IperfIntervalResultsOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IperfIntervalResultsOut {
+    pub upload: Option<IperfDirectionDetailsOut>,
+    pub download: Option<IperfDirectionDetailsOut>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IperfDirectionDetailsOut {
+    pub intervals: Vec<IperfIntervalOut>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IperfIntervalOut {
+    pub elapsed_seconds: f64,
+    pub bytes: u64,
+    pub mbps: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -93,6 +119,7 @@ mod tests {
                 }),
                 download: None,
             },
+            details: None,
         };
 
         let json = serde_json::to_string(&body).expect("json serialization should succeed");

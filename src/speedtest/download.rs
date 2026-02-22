@@ -13,6 +13,11 @@ use crate::util::{clamp_worker_count, mbps_from_bytes};
 pub struct DownloadStats {
     pub bytes: u64,
     pub mbps: f64,
+    pub request_attempts: u64,
+    pub request_successes: u64,
+    pub request_http_errors: u64,
+    pub request_transport_errors: u64,
+    pub response_read_errors: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,12 +42,22 @@ where
     let start_at = Instant::now();
     let stop_at = start_at + Duration::from_secs(seconds);
     let total_bytes = Arc::new(AtomicU64::new(0));
+    let request_attempts = Arc::new(AtomicU64::new(0));
+    let request_successes = Arc::new(AtomicU64::new(0));
+    let request_http_errors = Arc::new(AtomicU64::new(0));
+    let request_transport_errors = Arc::new(AtomicU64::new(0));
+    let response_read_errors = Arc::new(AtomicU64::new(0));
 
     let mut tasks = JoinSet::new();
     for worker in 0..worker_count {
         let worker_client = client.clone();
         let worker_server = server.clone();
         let worker_bytes = Arc::clone(&total_bytes);
+        let worker_attempts = Arc::clone(&request_attempts);
+        let worker_successes = Arc::clone(&request_successes);
+        let worker_http_errors = Arc::clone(&request_http_errors);
+        let worker_transport_errors = Arc::clone(&request_transport_errors);
+        let worker_read_errors = Arc::clone(&response_read_errors);
         tasks.spawn(async move {
             const SIZES: [usize; 8] = [500, 750, 1000, 1500, 2000, 2500, 3000, 4000];
             let mut cursor = worker % SIZES.len();
@@ -55,16 +70,30 @@ where
                     break;
                 };
 
+                worker_attempts.fetch_add(1, Ordering::Relaxed);
+
                 let response = match worker_client.get(url).send().await {
                     Ok(response) => match response.error_for_status() {
                         Ok(response) => response,
-                        Err(_) => continue,
+                        Err(_) => {
+                            worker_http_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     },
-                    Err(_) => continue,
+                    Err(_) => {
+                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
 
-                if let Ok(body) = response.bytes().await {
-                    worker_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                match response.bytes().await {
+                    Ok(body) => {
+                        worker_successes.fetch_add(1, Ordering::Relaxed);
+                        worker_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -90,5 +119,10 @@ where
     Ok(DownloadStats {
         bytes,
         mbps: mbps_from_bytes(bytes, seconds),
+        request_attempts: request_attempts.load(Ordering::Relaxed),
+        request_successes: request_successes.load(Ordering::Relaxed),
+        request_http_errors: request_http_errors.load(Ordering::Relaxed),
+        request_transport_errors: request_transport_errors.load(Ordering::Relaxed),
+        response_read_errors: response_read_errors.load(Ordering::Relaxed),
     })
 }
