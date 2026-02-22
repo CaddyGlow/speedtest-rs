@@ -1,0 +1,117 @@
+name: Manual Build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: true
+        type: string
+      version:
+        description: Version label for packaged artifacts
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: true
+        default: main
+        type: string
+      version:
+        description: Version label for packaged artifacts (for example v1.2.3-special)
+        required: true
+        type: string
+
+env:
+  APP_NAME: tunmux-speedtest
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install aarch64 linux linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cross for musl aarch64
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build aarch64 linux release binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build aarch64 linux musl release binary
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Package unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          asset_dir="${APP_NAME}-${version}-${{ matrix.target }}"
+          mkdir -p "${asset_dir}"
+          cp "target/${{ matrix.target }}/release/${APP_NAME}" "${asset_dir}/"
+          tar -czf "${asset_dir}.tar.gz" "${asset_dir}"
+
+      - name: Package windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+          $assetDir = "${env:APP_NAME}-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:APP_NAME}.exe" "$assetDir/"
+          Compress-Archive -Path $assetDir -DestinationPath "$assetDir.zip" -Force
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ inputs.version }}
+          path: |
+            *.tar.gz
+            *.zip
