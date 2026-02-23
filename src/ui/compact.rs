@@ -24,6 +24,7 @@ pub struct SpeedProgressBar {
     gauge_ceiling_mbps: Cell<f64>,
     last_sample_bytes: Cell<u64>,
     last_sample_elapsed_nanos: Cell<u128>,
+    last_non_zero_mbps: Cell<f64>,
 }
 
 impl CompactUi {
@@ -93,6 +94,7 @@ impl CompactUi {
             gauge_ceiling_mbps: Cell::new(100.0),
             last_sample_bytes: Cell::new(0),
             last_sample_elapsed_nanos: Cell::new(0),
+            last_non_zero_mbps: Cell::new(0.0),
         }
     }
 
@@ -100,17 +102,22 @@ impl CompactUi {
         let elapsed_secs = sample.elapsed.as_secs().min(progress.total_seconds);
         progress.bar.set_position(elapsed_secs);
         progress.bar.set_message(progress.phase.clone());
-        let interval_mbps = estimate_interval_mbps(
+        let mut mbps = estimate_interval_mbps(
             sample.bytes,
             sample.elapsed.as_nanos(),
             progress.last_sample_bytes.get(),
             progress.last_sample_elapsed_nanos.get(),
             sample.mbps,
         );
-        let mbps = if interval_mbps.is_finite() {
-            interval_mbps.max(0.0)
+        if !mbps.is_finite() {
+            mbps = 0.0;
+        }
+        let mbps = if mbps <= 0.0 {
+            let previous = progress.last_non_zero_mbps.get();
+            if previous > 0.0 { previous } else { 0.0 }
         } else {
-            0.0
+            progress.last_non_zero_mbps.set(mbps);
+            mbps
         };
         progress.last_sample_bytes.set(sample.bytes);
         progress
