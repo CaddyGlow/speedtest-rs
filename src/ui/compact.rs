@@ -22,6 +22,8 @@ pub struct SpeedProgressBar {
     total_seconds: u64,
     bar: ProgressBar,
     gauge_ceiling_mbps: Cell<f64>,
+    last_sample_bytes: Cell<u64>,
+    last_sample_elapsed_nanos: Cell<u128>,
 }
 
 impl CompactUi {
@@ -89,6 +91,8 @@ impl CompactUi {
             total_seconds,
             bar,
             gauge_ceiling_mbps: Cell::new(100.0),
+            last_sample_bytes: Cell::new(0),
+            last_sample_elapsed_nanos: Cell::new(0),
         }
     }
 
@@ -96,8 +100,22 @@ impl CompactUi {
         let elapsed_secs = sample.elapsed.as_secs().min(progress.total_seconds);
         progress.bar.set_position(elapsed_secs);
         progress.bar.set_message(progress.phase.clone());
-        let mbps = sample.mbps.max(0.0);
-        let mbps = if mbps.is_finite() { mbps } else { 0.0 };
+        let interval_mbps = estimate_interval_mbps(
+            sample.bytes,
+            sample.elapsed.as_nanos(),
+            progress.last_sample_bytes.get(),
+            progress.last_sample_elapsed_nanos.get(),
+            sample.mbps,
+        );
+        let mbps = if interval_mbps.is_finite() {
+            interval_mbps.max(0.0)
+        } else {
+            0.0
+        };
+        progress.last_sample_bytes.set(sample.bytes);
+        progress
+            .last_sample_elapsed_nanos
+            .set(sample.elapsed.as_nanos());
         let ceiling_mbps = ensure_gauge_ceiling(progress, mbps);
         let speed_gauge = format_speed_gauge(mbps, ceiling_mbps);
         let latency_label = sample
@@ -187,9 +205,44 @@ fn format_speed_gauge(mbps: f64, ceiling_mbps: f64) -> String {
     gauge
 }
 
+fn estimate_interval_mbps(
+    current_bytes: u64,
+    current_elapsed_nanos: u128,
+    previous_bytes: u64,
+    previous_elapsed_nanos: u128,
+    fallback_mbps: f64,
+) -> f64 {
+    if current_elapsed_nanos <= previous_elapsed_nanos {
+        return fallback_mbps;
+    }
+
+    let elapsed_nanos = current_elapsed_nanos - previous_elapsed_nanos;
+    if elapsed_nanos == 0 {
+        return fallback_mbps;
+    }
+
+    if current_bytes < previous_bytes {
+        return fallback_mbps;
+    }
+
+    let delta_bytes = current_bytes - previous_bytes;
+    if delta_bytes == 0 {
+        return fallback_mbps;
+    }
+
+    let elapsed_seconds = elapsed_nanos as f64 / 1_000_000_000.0;
+    let mbps = (delta_bytes as f64 * 8.0) / elapsed_seconds / 1_000_000.0;
+
+    if mbps.is_finite() {
+        mbps
+    } else {
+        fallback_mbps
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_speed_gauge, gauge_ceiling_for_speed};
+    use super::{estimate_interval_mbps, format_speed_gauge, gauge_ceiling_for_speed};
 
     #[test]
     fn speed_gauge_ceiling_uses_next_bucket() {
@@ -202,5 +255,19 @@ mod tests {
     fn speed_gauge_formats_ascii_bar() {
         let gauge = format_speed_gauge(50.0, 100.0);
         assert_eq!(gauge, "[======......]@100");
+    }
+
+    #[test]
+    fn estimate_interval_speed_uses_byte_delta() {
+        let fallback = 3.2;
+        let mbps = estimate_interval_mbps(1_000_000, 1_000_000_000, 200_000, 500_000_000, fallback);
+        assert!((mbps - 12.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn estimate_interval_speed_returns_fallback_without_progress() {
+        let fallback = 3.2;
+        let mbps = estimate_interval_mbps(500_000, 1_000_000_000, 500_000, 500_000_000, fallback);
+        assert!((mbps - fallback).abs() < 0.0001);
     }
 }
