@@ -246,23 +246,22 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                             Some(ui.begin_speed_progress("download", effective_args.download_seconds));
                         download_last = None;
 
-                        if render_ui && live_latency_task.is_none() {
-                            if let (Some(server_id), Some((base_latency, base_jitter))) =
+                        if render_ui
+                            && live_latency_task.is_none()
+                            && let (Some(server_id), Some((base_latency, base_jitter))) =
                                 (selected_server_id, selected_latency)
-                            {
-                                if let Some(server) = servers_by_id.get(&server_id) {
-                                    let (state, task, stop_flag) = spawn_live_latency_monitor(
-                                        client.clone(),
-                                        server.clone(),
-                                        Duration::from_millis(1_000),
-                                        base_latency,
-                                        base_jitter,
-                                    );
-                                    live_latency_state = Some(state);
-                                    live_latency_task = Some(task);
-                                    live_latency_stop = Some(stop_flag);
-                                }
-                            }
+                            && let Some(server) = servers_by_id.get(&server_id)
+                        {
+                            let (state, task, stop_flag) = spawn_live_latency_monitor(
+                                client.clone(),
+                                server.clone(),
+                                Duration::from_millis(1_000),
+                                base_latency,
+                                base_jitter,
+                            );
+                            live_latency_state = Some(state);
+                            live_latency_task = Some(task);
+                            live_latency_stop = Some(stop_flag);
                         }
                     }
                     engine::EngineStage::Upload => {
@@ -271,23 +270,22 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                             Some(ui.begin_speed_progress("upload", effective_args.upload_seconds));
                         upload_last = None;
 
-                        if render_ui && live_latency_task.is_none() {
-                            if let (Some(server_id), Some((base_latency, base_jitter))) =
+                        if render_ui
+                            && live_latency_task.is_none()
+                            && let (Some(server_id), Some((base_latency, base_jitter))) =
                                 (selected_server_id, selected_latency)
-                            {
-                                if let Some(server) = servers_by_id.get(&server_id) {
-                                    let (state, task, stop_flag) = spawn_live_latency_monitor(
-                                        client.clone(),
-                                        server.clone(),
-                                        Duration::from_millis(1_000),
-                                        base_latency,
-                                        base_jitter,
-                                    );
-                                    live_latency_state = Some(state);
-                                    live_latency_task = Some(task);
-                                    live_latency_stop = Some(stop_flag);
-                                }
-                            }
+                            && let Some(server) = servers_by_id.get(&server_id)
+                        {
+                            let (state, task, stop_flag) = spawn_live_latency_monitor(
+                                client.clone(),
+                                server.clone(),
+                                Duration::from_millis(1_000),
+                                base_latency,
+                                base_jitter,
+                            );
+                            live_latency_state = Some(state);
+                            live_latency_task = Some(task);
+                            live_latency_stop = Some(stop_flag);
                         }
                     }
                     engine::EngineStage::Save => {
@@ -412,6 +410,15 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                         _ => {}
                     }
                 }
+                engine::EngineEvent::StageResult { stage, mbps, bytes } => match stage {
+                    engine::EngineStage::Download => {
+                        download_last = Some((mbps, bytes));
+                    }
+                    engine::EngineStage::Upload => {
+                        upload_last = Some((mbps, bytes));
+                    }
+                    _ => {}
+                },
                 engine::EngineEvent::StageFinished(stage) => match stage {
                     engine::EngineStage::Download => {
                         if let Some(progress) = download_progress.take() {

@@ -57,6 +57,11 @@ pub enum EngineEvent {
         bytes: u64,
         active_connections: usize,
     },
+    StageResult {
+        stage: EngineStage,
+        mbps: f64,
+        bytes: u64,
+    },
     StageFinished(EngineStage),
     SavePayloadBuilt {
         guid: String,
@@ -348,6 +353,12 @@ where
                     }
                 }
 
+                on_event(EngineEvent::StageResult {
+                    stage: EngineStage::Download,
+                    mbps: stats.mbps,
+                    bytes: stats.bytes,
+                });
+
                 on_event(EngineEvent::StageFinished(EngineStage::Download));
             }
             EngineStage::Upload => {
@@ -429,6 +440,12 @@ where
                             .then_some(remote_intervals),
                     });
                 }
+
+                on_event(EngineEvent::StageResult {
+                    stage: EngineStage::Upload,
+                    mbps: stats.mbps,
+                    bytes: stats.bytes,
+                });
 
                 on_event(EngineEvent::StageFinished(EngineStage::Upload));
             }
