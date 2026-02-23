@@ -1,5 +1,10 @@
+pub mod api;
+pub mod browser_protocol;
 pub mod config;
 pub mod download;
+pub mod modern_protocol;
+pub mod sdk_payload;
 pub mod select;
 pub mod servers;
+pub mod session;
 pub mod upload;

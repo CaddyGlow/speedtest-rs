@@ -13,6 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 
+use crate::ui::SpeedProgressSample;
+
 #[derive(Debug, Clone)]
 struct ProgressState {
     phase: String,
@@ -20,6 +22,9 @@ struct ProgressState {
     elapsed: Duration,
     mbps: f64,
     bytes: u64,
+    active_connections: usize,
+    latency_ms: Option<f64>,
+    jitter_ms: Option<f64>,
 }
 
 pub struct FullscreenUi {
@@ -78,6 +83,9 @@ impl FullscreenUi {
             elapsed: Duration::ZERO,
             mbps: 0.0,
             bytes: 0,
+            active_connections: 0,
+            latency_ms: None,
+            jitter_ms: None,
         });
         self.draw_now()
     }
@@ -86,16 +94,17 @@ impl FullscreenUi {
         &mut self,
         phase: &str,
         total_seconds: u64,
-        elapsed: Duration,
-        mbps: f64,
-        bytes: u64,
+        sample: SpeedProgressSample,
     ) -> anyhow::Result<()> {
         self.progress = Some(ProgressState {
             phase: phase.to_string(),
             total_seconds: total_seconds.max(1),
-            elapsed,
-            mbps,
-            bytes,
+            elapsed: sample.elapsed,
+            mbps: sample.mbps,
+            bytes: sample.bytes,
+            active_connections: sample.active_connections,
+            latency_ms: sample.latency_ms,
+            jitter_ms: sample.jitter_ms,
         });
         self.draw_throttled()
     }
@@ -177,10 +186,21 @@ impl FullscreenUi {
                 (
                     ratio,
                     format!(
-                        "{} {:.2} Mbps {:.1} MB",
+                        "{} {:.2} Mbps {:.1} MB {} conn{}{}",
                         current.phase,
                         current.mbps,
-                        current.bytes as f64 / 1_000_000.0
+                        current.bytes as f64 / 1_000_000.0,
+                        current.active_connections,
+                        current
+                            .latency_ms
+                            .filter(|value| value.is_finite() && *value >= 0.0)
+                            .map(|value| format!(" {value:.2}ms"))
+                            .unwrap_or_default(),
+                        current
+                            .jitter_ms
+                            .filter(|value| value.is_finite() && *value >= 0.0)
+                            .map(|value| format!(" j{value:.2}"))
+                            .unwrap_or_default(),
                     ),
                 )
             } else {

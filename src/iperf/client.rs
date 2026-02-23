@@ -149,11 +149,13 @@ where
 
     let local_streams = run_stream_data(
         streams,
-        config.protocol,
-        direction,
-        seconds,
-        packet_size,
-        bitrate_bps,
+        StreamRunPlan {
+            protocol: config.protocol,
+            direction,
+            seconds,
+            packet_size,
+            bitrate_bps,
+        },
         progress_interval,
         on_progress,
     )
@@ -321,11 +323,7 @@ async fn create_streams(
 
 async fn run_stream_data<F>(
     streams: Vec<DataStream>,
-    protocol: IperfProtocol,
-    direction: IperfDirection,
-    seconds: u64,
-    packet_size: usize,
-    bitrate_bps: Option<u64>,
+    plan: StreamRunPlan,
     progress_interval: Option<Duration>,
     on_progress: &mut F,
 ) -> Result<Vec<LocalStreamResult>>
@@ -335,24 +333,21 @@ where
     let stream_count = streams.len().max(1);
     let total_bytes = Arc::new(AtomicU64::new(0));
     let start_at = Instant::now();
-    let stop_at = start_at + Duration::from_secs(seconds);
+    let stop_at = start_at + Duration::from_secs(plan.seconds);
+    let worker_config = StreamWorkerConfig {
+        protocol: plan.protocol,
+        direction: plan.direction,
+        stop_at,
+        packet_size: plan.packet_size,
+        bitrate_bps: plan.bitrate_bps,
+        stream_count,
+    };
 
     let mut workers = JoinSet::new();
     for (idx, stream) in streams.into_iter().enumerate() {
         let total_bytes_ref = Arc::clone(&total_bytes);
         workers.spawn(async move {
-            run_one_stream(
-                idx + 1,
-                stream,
-                protocol,
-                direction,
-                stop_at,
-                packet_size,
-                bitrate_bps,
-                stream_count,
-                total_bytes_ref,
-            )
-            .await
+            run_one_stream(idx + 1, stream, worker_config, total_bytes_ref).await
         });
     }
 
@@ -381,39 +376,22 @@ where
 async fn run_one_stream(
     id: usize,
     mut stream: DataStream,
-    protocol: IperfProtocol,
-    direction: IperfDirection,
-    stop_at: Instant,
-    packet_size: usize,
-    bitrate_bps: Option<u64>,
-    stream_count: usize,
+    worker: StreamWorkerConfig,
     total_bytes: Arc<AtomicU64>,
 ) -> Result<LocalStreamResult> {
-    match protocol {
+    match worker.protocol {
         IperfProtocol::Tcp => {
             run_one_stream_tcp(
                 id,
                 &mut stream,
-                direction,
-                stop_at,
-                packet_size,
+                worker.direction,
+                worker.stop_at,
+                worker.packet_size,
                 total_bytes,
             )
             .await
         }
-        IperfProtocol::Udp => {
-            run_one_stream_udp(
-                id,
-                &mut stream,
-                direction,
-                stop_at,
-                packet_size,
-                bitrate_bps,
-                stream_count,
-                total_bytes,
-            )
-            .await
-        }
+        IperfProtocol::Udp => run_one_stream_udp(id, &mut stream, worker, total_bytes).await,
     }
 }
 
@@ -467,31 +445,28 @@ async fn run_one_stream_tcp(
 async fn run_one_stream_udp(
     id: usize,
     stream: &mut DataStream,
-    direction: IperfDirection,
-    stop_at: Instant,
-    packet_size: usize,
-    bitrate_bps: Option<u64>,
-    stream_count: usize,
+    worker: StreamWorkerConfig,
     total_bytes: Arc<AtomicU64>,
 ) -> Result<LocalStreamResult> {
     let mut stats = LocalStreamResult::new(id);
-    let mut recv_buf = vec![0_u8; packet_size.max(2048)];
+    let mut recv_buf = vec![0_u8; worker.packet_size.max(2048)];
     let mut rx_metrics = UdpReceiveMetrics::default();
     let mut sequence = 1_u32;
 
-    let per_worker_bitrate = bitrate_bps
-        .and_then(|value| value.checked_div(stream_count as u64))
+    let per_worker_bitrate = worker
+        .bitrate_bps
+        .and_then(|value| value.checked_div(worker.stream_count as u64))
         .filter(|value| *value > 0);
     let send_delay = per_worker_bitrate.map(|bps| {
-        let bits = (packet_size as u128) * 8;
+        let bits = (worker.packet_size as u128) * 8;
         let nanos = (bits * 1_000_000_000_u128) / u128::from(bps.max(1));
         Duration::from_nanos(nanos.max(1_000_000) as u64)
     });
 
-    while Instant::now() < stop_at {
-        let io = match direction {
+    while Instant::now() < worker.stop_at {
+        let io = match worker.direction {
             IperfDirection::Upload => {
-                let packet = build_iperf_udp_packet(sequence, packet_size);
+                let packet = build_iperf_udp_packet(sequence, worker.packet_size);
                 sequence = sequence.wrapping_add(1);
                 udp_send(stream, &packet).await
             }
@@ -502,7 +477,7 @@ async fn run_one_stream_udp(
             stats.bytes += size as u64;
             total_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
-            if matches!(direction, IperfDirection::Upload) {
+            if matches!(worker.direction, IperfDirection::Upload) {
                 stats.packets = Some(stats.packets.unwrap_or(0) + 1);
             } else {
                 let header = parse_iperf_udp_header(&recv_buf[..size]);
@@ -511,13 +486,13 @@ async fn run_one_stream_udp(
         }
 
         if let Some(delay) = send_delay
-            && matches!(direction, IperfDirection::Upload)
+            && matches!(worker.direction, IperfDirection::Upload)
         {
             sleep(delay).await;
         }
     }
 
-    if matches!(direction, IperfDirection::Download) {
+    if matches!(worker.direction, IperfDirection::Download) {
         stats.packets = Some(rx_metrics.total_packets);
         stats.lost_packets = Some(rx_metrics.lost_packets);
         stats.loss_percent = rx_metrics.loss_percent();
@@ -780,7 +755,7 @@ async fn read_json_frame(stream: &mut TcpStream, max_size: Option<usize>) -> Res
 
     let mut body = vec![0_u8; size];
     stream.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body).context("failed parsing iperf3 JSON frame")?)
+    serde_json::from_slice(&body).context("failed parsing iperf3 JSON frame")
 }
 
 async fn read_state(stream: &mut TcpStream) -> Result<i8> {
@@ -848,6 +823,25 @@ enum DataStream {
     Tcp(TcpStream),
     UdpDirect(UdpSocket),
     UdpSocks(Socks5UdpAssociation),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamRunPlan {
+    protocol: IperfProtocol,
+    direction: IperfDirection,
+    seconds: u64,
+    packet_size: usize,
+    bitrate_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamWorkerConfig {
+    protocol: IperfProtocol,
+    direction: IperfDirection,
+    stop_at: Instant,
+    packet_size: usize,
+    bitrate_bps: Option<u64>,
+    stream_count: usize,
 }
 
 #[derive(Debug, Clone)]

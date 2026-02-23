@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::iperf::schema::{IperfDirectionOut, IperfJsonV1, IperfProtocolOut};
 use crate::model::RunResult;
@@ -6,13 +7,50 @@ use crate::model::RunResult;
 pub fn print_human(result: &RunResult) {
     println!("timestamp: {}", result.timestamp);
 
+    if let Some(api) = result.speedtest_api.as_deref() {
+        println!("speedtest_api: {}", api);
+    }
+
     if let Some(server) = &result.server {
+        let latency = match (server.latency_ms, server.latency_stddev_ms) {
+            (Some(avg), Some(std)) => format!("avg={avg:.2}ms std={std:.2}ms"),
+            (Some(avg), None) => format!("avg={avg:.2}ms"),
+            _ => "n/a".to_string(),
+        };
+
         println!(
-            "server: {} ({}, {}, {}, host={}, distance={:.2} km)",
-            server.id, server.sponsor, server.name, server.country, server.host, server.distance_km
+            "server: {} ({}, {}, {}, host={}, distance={:.2} km, latency={})",
+            server.id,
+            server.sponsor,
+            server.name,
+            server.country,
+            server.host,
+            server.distance_km,
+            latency,
         );
     } else {
         println!("server: not selected");
+    }
+
+    if let Some(pool) = &result.server_pool
+        && !pool.is_empty()
+    {
+        println!("server_pool ({}):", pool.len());
+        for server in pool {
+            let latency = match (server.latency_ms, server.latency_stddev_ms) {
+                (Some(avg), Some(std)) => format!("avg={avg:.2}ms std={std:.2}ms"),
+                (Some(avg), None) => format!("avg={avg:.2}ms"),
+                _ => "n/a".to_string(),
+            };
+            let download = match (server.download_avg_mbps, server.download_bytes) {
+                (Some(mbps), Some(bytes)) => format!("avg={mbps:.2}Mbps bytes={bytes}"),
+                _ => "n/a".to_string(),
+            };
+            println!(
+                "  - id={} name={} host={} latency={} download={}",
+                server.id, server.name, server.host, latency, download
+            );
+        }
     }
 
     if let Some(client) = &result.client {
@@ -40,7 +78,10 @@ pub fn print_human(result: &RunResult) {
     println!("proxy: {}", result.proxy.as_deref().unwrap_or("none"));
 }
 
-pub fn print_json(result: &RunResult) -> Result<()> {
+pub fn print_json<T>(result: &T) -> Result<()>
+where
+    T: Serialize,
+{
     let body = serde_json::to_string_pretty(result)?;
     println!("{}", body);
     Ok(())

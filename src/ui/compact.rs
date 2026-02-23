@@ -1,6 +1,8 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
+use crate::ui::SpeedProgressSample;
+
 pub struct SpeedProgressBar {
     phase: String,
     total_seconds: u64,
@@ -35,23 +37,31 @@ pub fn begin_speed_progress(phase: &str, seconds: u64) -> SpeedProgressBar {
     }
 }
 
-pub fn update_speed_progress(
-    progress: &SpeedProgressBar,
-    elapsed: Duration,
-    mbps: f64,
-    bytes: u64,
-) {
-    let elapsed_secs = elapsed.as_secs().min(progress.total_seconds);
+pub fn update_speed_progress(progress: &SpeedProgressBar, sample: SpeedProgressSample) {
+    let elapsed_secs = sample.elapsed.as_secs().min(progress.total_seconds);
     progress.bar.set_position(elapsed_secs);
     progress.bar.set_message(progress.phase.clone());
+    let latency_label = sample
+        .latency_ms
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| format!(" {value:.2}ms"))
+        .unwrap_or_default();
+    let jitter_label = sample
+        .jitter_ms
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| format!(" j{value:.2}"))
+        .unwrap_or_default();
     progress.bar.set_prefix(format!(
-        "{mbps:7.2} Mbps {:.1} MB",
-        bytes as f64 / 1_000_000.0
+        "{:7.2} Mbps {:.1} MB {} conn{latency_label}{jitter_label}",
+        sample.mbps,
+        sample.bytes as f64 / 1_000_000.0,
+        sample.active_connections,
     ));
 }
 
 pub fn finish_speed_progress(progress: SpeedProgressBar, mbps: f64, bytes: u64) {
     progress.bar.set_position(progress.total_seconds);
+    progress.bar.set_prefix(String::new());
     progress.bar.finish_with_message(format!(
         "{} done {mbps:.2} Mbps ({:.1} MB)",
         progress.phase,

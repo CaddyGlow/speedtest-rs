@@ -11,6 +11,16 @@ pub enum SpeedProgress {
     Fullscreen { phase: String, total_seconds: u64 },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SpeedProgressSample {
+    pub elapsed: Duration,
+    pub mbps: f64,
+    pub bytes: u64,
+    pub active_connections: usize,
+    pub latency_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+}
+
 pub struct Ui {
     enabled: bool,
     mode: TuiMode,
@@ -126,13 +136,7 @@ impl Ui {
         }
     }
 
-    pub fn update_speed_progress(
-        &mut self,
-        progress: &SpeedProgress,
-        elapsed: Duration,
-        mbps: f64,
-        bytes: u64,
-    ) {
+    pub fn update_speed_progress(&mut self, progress: &SpeedProgress, sample: SpeedProgressSample) {
         if !self.enabled {
             return;
         }
@@ -140,20 +144,15 @@ impl Ui {
         match progress {
             SpeedProgress::Disabled => {}
             SpeedProgress::Compact(bar) => {
-                compact::update_speed_progress(bar, elapsed, mbps, bytes);
+                compact::update_speed_progress(bar, sample);
             }
             SpeedProgress::Fullscreen {
                 phase,
                 total_seconds,
             } => {
                 if let Some(fullscreen) = self.fullscreen.as_mut()
-                    && let Err(error) = fullscreen.update_speed_progress(
-                        phase,
-                        *total_seconds,
-                        elapsed,
-                        mbps,
-                        bytes,
-                    )
+                    && let Err(error) =
+                        fullscreen.update_speed_progress(phase, *total_seconds, sample)
                 {
                     self.fallback_to_compact(error.to_string(), phase);
                 }

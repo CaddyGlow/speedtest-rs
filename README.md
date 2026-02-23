@@ -9,9 +9,13 @@ It is intentionally separate from the `tunmux` workspace and has no dependency o
 - best server auto selection by measured latency
 - configurable parallel download and upload workers
 - proxy support: HTTP, HTTPS, SOCKS5, SOCKS5h
+- multiple speedtest API modes: `legacy` and `modern` (browser SDK)
+- modern transport switch: `--modern-mode xhr|tcp` (same modern SDK server discovery, transfer differs)
+- modern pooled transfer across nearest measured servers (`--modern-pool-size`)
+- modern session cache for cookies, guid, and client auth token
 - native `iperf` command with dedicated JSON schema (`tunmux.iperf.v1`)
 - compact TUI and fullscreen TUI modes
-- human readable and JSON output
+- human readable output plus SDK-compatible JSON output
 
 ## Status
 
@@ -51,9 +55,26 @@ cargo run -- run --tui compact
 cargo run -- run --tui fullscreen
 cargo run -- run --proxy socks5h://127.0.0.1:1080
 cargo run -- run --download-connections 8 --upload-connections 6
+cargo run -- run --speedtest-api auto
+cargo run -- run --speedtest-api legacy
+cargo run -- run --speedtest-api modern
+cargo run -- run --speedtest-api modern --modern-mode xhr
+cargo run -- run --speedtest-api modern --modern-mode tcp
+cargo run -- run --speedtest-api modern --modern-pool-size 4
+cargo run -- run --speedtest-api modern-tcp
 cargo run -- run --json
 cargo run -- run --json --details
+cargo run -- run --sdk-json-out speedtest-sdk-result.json
+RUST_LOG=debug cargo run -- run --speedtest-api modern --modern-mode tcp --modern-pool-size 8 --
 ```
+
+Modern session cache path:
+
+- `run --json` emits a Speedtest SDK-style payload (`st4-js` model)
+- `run --json --details` emits the native `RunResult` diagnostic schema with interval counters
+
+- `${XDG_CACHE_HOME}/tunmux-speedtest/modern-session.json` when `XDG_CACHE_HOME` is set
+- `~/.cache/tunmux-speedtest/modern-session.json` otherwise
 
 Native iperf command examples:
 

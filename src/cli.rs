@@ -1,5 +1,7 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
+use crate::speedtest::api::{ModernTransportMode, SpeedtestApiMode};
+
 const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -49,6 +51,14 @@ pub struct CacheArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
+    /// Speedtest API backend mode
+    #[arg(long, default_value = "auto")]
+    pub speedtest_api: SpeedtestApiMode,
+
+    /// Transport mode when using --speedtest-api modern
+    #[arg(long, default_value = "xhr")]
+    pub modern_mode: ModernTransportMode,
+
     /// Optional server id override
     #[arg(long)]
     pub server_id: Option<u64>,
@@ -57,8 +67,12 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub candidate_servers: usize,
 
+    /// Number of servers to include in modern API transfer pool
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
+    pub modern_pool_size: usize,
+
     /// Number of latency samples per candidate server
-    #[arg(long, default_value_t = 3, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub latency_samples: usize,
 
     /// Parallel download workers
@@ -96,6 +110,10 @@ pub struct RunArgs {
     /// Emit machine-readable JSON result
     #[arg(long)]
     pub json: bool,
+
+    /// Write SDK-compatible result JSON payload to file
+    #[arg(long, value_name = "PATH")]
+    pub sdk_json_out: Option<String>,
 
     /// Include interval and diagnostic details in JSON output
     #[arg(long, requires = "json")]
@@ -202,9 +220,12 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             command: Some(Command::Run(RunArgs {
+                speedtest_api: SpeedtestApiMode::Auto,
+                modern_mode: ModernTransportMode::Xhr,
                 server_id: None,
                 candidate_servers: 10,
-                latency_samples: 3,
+                modern_pool_size: 4,
+                latency_samples: 10,
                 download_connections: 8,
                 upload_connections: 8,
                 download_seconds: 10,
@@ -214,6 +235,7 @@ impl Default for Cli {
                 proxy: None,
                 tui: TuiMode::Compact,
                 json: false,
+                sdk_json_out: None,
                 details: false,
             })),
         }
@@ -293,9 +315,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_speedtest_api_mode() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--speedtest-api", "modern"])
+            .expect("run --speedtest-api modern should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(matches!(
+            args.speedtest_api,
+            super::SpeedtestApiMode::Modern
+        ));
+    }
+
+    #[test]
+    fn parses_speedtest_api_mode_modern_tcp() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--speedtest-api", "modern-tcp"])
+            .expect("run --speedtest-api modern-tcp should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(matches!(
+            args.speedtest_api,
+            super::SpeedtestApiMode::ModernTcp
+        ));
+    }
+
+    #[test]
+    fn parses_modern_transport_mode() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "run",
+            "--speedtest-api",
+            "modern",
+            "--modern-mode",
+            "tcp",
+        ])
+        .expect("run --speedtest-api modern --modern-mode tcp should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(matches!(args.modern_mode, super::ModernTransportMode::Tcp));
+    }
+
+    #[test]
+    fn parses_sdk_json_out_flag() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "run",
+            "--sdk-json-out",
+            "sdk-result.json",
+        ])
+        .expect("run --sdk-json-out should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.sdk_json_out.as_deref(), Some("sdk-result.json"));
+    }
+
+    #[test]
     fn defaults_to_run_command() {
         let cli = Cli::default();
-        assert!(matches!(cli.command, Some(Command::Run(_))));
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(matches!(args.speedtest_api, super::SpeedtestApiMode::Auto));
+        assert!(matches!(args.modern_mode, super::ModernTransportMode::Xhr));
+        assert_eq!(args.modern_pool_size, 4);
     }
 
     #[test]
