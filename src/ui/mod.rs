@@ -21,12 +21,19 @@ pub struct SpeedProgressSample {
 
 pub struct Ui {
     enabled: bool,
-    mode: TuiMode,
+    compact: Option<compact::CompactUi>,
 }
 
 impl Ui {
     pub fn new(mode: TuiMode, enabled: bool) -> Self {
-        Self { enabled, mode }
+        let _ = mode;
+        let compact = if enabled {
+            Some(compact::CompactUi::new())
+        } else {
+            None
+        };
+
+        Self { enabled, compact }
     }
 
     pub fn render_phase(&mut self, phase: &str) {
@@ -34,8 +41,8 @@ impl Ui {
             return;
         }
 
-        match self.mode {
-            TuiMode::Compact => compact::render_phase(phase),
+        if let Some(compact) = self.compact.as_mut() {
+            compact.render_phase(phase);
         }
     }
 
@@ -44,8 +51,8 @@ impl Ui {
             return;
         }
 
-        match self.mode {
-            TuiMode::Compact => compact::render_metric(label, value),
+        if let Some(compact) = self.compact.as_mut() {
+            compact.render_metric(label, value);
         }
     }
 
@@ -54,10 +61,10 @@ impl Ui {
             return SpeedProgress::Disabled;
         }
 
-        match self.mode {
-            TuiMode::Compact => {
-                SpeedProgress::Compact(compact::begin_speed_progress(phase, seconds))
-            }
+        if let Some(compact) = self.compact.as_ref() {
+            SpeedProgress::Compact(compact.begin_speed_progress(phase, seconds))
+        } else {
+            SpeedProgress::Disabled
         }
     }
 
@@ -75,9 +82,11 @@ impl Ui {
             return;
         }
 
-        match progress {
-            SpeedProgress::Disabled => {}
-            SpeedProgress::Compact(bar) => compact::update_speed_progress(bar, sample),
+        if let Some(compact) = self.compact.as_ref() {
+            match progress {
+                SpeedProgress::Disabled => {}
+                SpeedProgress::Compact(bar) => compact.update_speed_progress(bar, sample),
+            }
         }
     }
 
@@ -92,11 +101,18 @@ impl Ui {
             return;
         }
 
-        match progress {
-            SpeedProgress::Disabled => {}
-            SpeedProgress::Compact(bar) => compact::finish_speed_progress(bar, mbps, bytes),
+        if let Some(compact) = self.compact.as_ref() {
+            match progress {
+                SpeedProgress::Disabled => {}
+                SpeedProgress::Compact(bar) => compact.finish_speed_progress(bar, mbps, bytes),
+            }
         }
     }
 
-    pub fn shutdown(&mut self) {}
+    pub fn shutdown(&mut self) {
+        if let Some(compact) = self.compact.as_mut() {
+            compact.shutdown();
+        }
+        self.compact = None;
+    }
 }
