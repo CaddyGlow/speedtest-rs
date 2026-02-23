@@ -2,8 +2,6 @@ pub mod compact;
 
 use std::time::Duration;
 
-use crate::cli::TuiMode;
-
 pub enum SpeedProgress {
     Disabled,
     Compact(compact::SpeedProgressBar),
@@ -25,8 +23,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(mode: TuiMode, enabled: bool) -> Self {
-        let _ = mode;
+    pub fn new(enabled: bool) -> Self {
         let compact = if enabled {
             Some(compact::CompactUi::new())
         } else {

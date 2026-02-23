@@ -150,8 +150,8 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     effective_args.download_connections = clamp_worker_count(effective_args.download_connections);
     effective_args.upload_connections = clamp_worker_count(effective_args.upload_connections);
 
-    let render_ui = !effective_args.json;
-    let mut ui = ui::Ui::new(effective_args.tui, render_ui);
+    let render_ui = !effective_args.json && !effective_args.no_progress;
+    let mut ui = ui::Ui::new(render_ui);
 
     ui.render_phase("building HTTP client");
 
@@ -588,8 +588,8 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
     let details_progress_interval = args
         .details
         .then_some(Duration::from_secs(details_interval_seconds));
-    let render_ui = !args.json;
-    let mut ui = ui::Ui::new(args.tui, render_ui);
+    let render_ui = !args.json && !args.no_progress;
+    let mut ui = ui::Ui::new(render_ui);
     ui.render_phase("preparing native iperf client");
     ui.render_metric(
         "protocol",

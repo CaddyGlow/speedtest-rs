@@ -14,7 +14,7 @@ It is intentionally separate from the `tunmux` workspace and has no dependency o
 - pooled transfer across nearest measured servers (`--pool-size`)
 - modern session cache for cookies, guid, and client auth token
 - native `iperf` command with dedicated JSON schema (`tunmux.iperf.v1`)
-- compact TUI mode with live progress
+- live progress output with optional disable flag
 - human readable output plus SDK-compatible JSON output
 
 ## Status
@@ -24,7 +24,7 @@ The crate now implements end-to-end runtime flow:
 - speedtest config and server catalog fetching
 - latency-based server selection
 - concurrent download and upload benchmarking
-- compact live progress bars for latency/download/upload stages
+- compact live progress bars for latency/download/upload stages with speed gauge
 
 Remaining hardening and polish work is tracked in `PLAN.md`.
 
@@ -51,7 +51,7 @@ cargo run -- plan
 Example runtime flags:
 
 ```bash
-cargo run -- run --tui compact
+cargo run -- run --no-progress
 cargo run -- run --proxy socks5h://127.0.0.1:1080
 cargo run -- run --download-connections 8 --upload-connections 6
 cargo run -- run --mode xhr
@@ -116,7 +116,7 @@ cargo run -- cache clear
 - `src/cli.rs` - clap arguments and validation surface
 - `src/runner.rs` - execution orchestration entry
 - `src/speedtest/` - benchmark and server selection modules
-- `src/ui/` - compact TUI modules
+- `src/ui/` - live progress UI modules
 
 ## Development
 

@@ -5,11 +5,6 @@ use crate::speedtest::api::ModernTransportMode;
 const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TuiMode {
-    Compact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum IperfProtocol {
     Tcp,
     Udp,
@@ -98,9 +93,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub proxy: Option<String>,
 
-    /// TUI mode
-    #[arg(long, default_value = "compact")]
-    pub tui: TuiMode,
+    /// Disable live progress rendering
+    #[arg(long)]
+    pub no_progress: bool,
 
     /// Emit machine-readable JSON result
     #[arg(long)]
@@ -174,9 +169,9 @@ pub struct IperfArgs {
     #[arg(long, conflicts_with = "upload_only")]
     pub download_only: bool,
 
-    /// TUI mode
-    #[arg(long, default_value = "compact")]
-    pub tui: TuiMode,
+    /// Disable live progress rendering
+    #[arg(long)]
+    pub no_progress: bool,
 
     /// Emit machine-readable JSON result
     #[arg(long)]
@@ -227,7 +222,7 @@ impl Default for Cli {
                 download_only: false,
                 upload_only: false,
                 proxy: None,
-                tui: TuiMode::Compact,
+                no_progress: false,
                 json: false,
                 sdk_json_out: None,
                 details: false,
@@ -346,6 +341,19 @@ mod tests {
 
         assert!(matches!(args.mode, super::ModernTransportMode::Xhr));
         assert_eq!(args.pool_size, 4);
+        assert!(!args.no_progress);
+    }
+
+    #[test]
+    fn parses_run_no_progress_flag() {
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--no-progress"])
+            .expect("run --no-progress should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(args.no_progress);
     }
 
     #[test]
@@ -431,6 +439,25 @@ mod tests {
         assert!(!args.auto_server);
         assert_eq!(args.seconds, 10);
         assert_eq!(args.parallel, 1);
+        assert!(!args.no_progress);
+    }
+
+    #[test]
+    fn parses_iperf_no_progress_flag() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--no-progress",
+        ])
+        .expect("iperf --no-progress should parse");
+
+        let Some(Command::Iperf(args)) = cli.command else {
+            panic!("expected iperf command");
+        };
+
+        assert!(args.no_progress);
     }
 
     #[test]
