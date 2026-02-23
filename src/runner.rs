@@ -1,7 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -22,12 +20,6 @@ use crate::speedtest;
 use crate::speedtest::engine::{self, EngineSettings as StageEngineSettings};
 use crate::ui;
 use crate::util::{clamp_worker_count, resolve_proxy_url};
-
-#[derive(Debug, Clone, Copy)]
-struct LiveLatencySnapshot {
-    latency_ms: Option<f64>,
-    jitter_ms: Option<f64>,
-}
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli
@@ -182,11 +174,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         .iter()
         .map(|server| (server.id, server.name.clone()))
         .collect::<HashMap<_, _>>();
-    let servers_by_id = servers
-        .iter()
-        .cloned()
-        .map(|server| (server.id, server))
-        .collect::<HashMap<_, _>>();
 
     let progress_interval = if render_ui {
         ui.progress_interval()
@@ -218,14 +205,9 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     let mut upload_progress = None;
     let mut download_last = None;
     let mut upload_last = None;
-    let mut selected_latency = None;
-    let mut selected_server_id = None;
     let mut probe_completed = 0_usize;
     let mut probe_failed = 0_usize;
     let mut probe_best: Option<(u64, String, f64, f64)> = None;
-    let mut live_latency_state = None;
-    let mut live_latency_task = None;
-    let mut live_latency_stop = None;
 
     let outcome = with_ctrl_c(engine::run_speedtest_engine(
         &client,
@@ -248,47 +230,13 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                             Some(ui.begin_speed_progress("download", effective_args.download_seconds));
                         download_last = None;
 
-                        if render_ui
-                            && live_latency_task.is_none()
-                            && let (Some(server_id), Some((base_latency, base_jitter))) =
-                                (selected_server_id, selected_latency)
-                            && let Some(server) = servers_by_id.get(&server_id)
-                        {
-                            let (state, task, stop_flag) = spawn_live_latency_monitor(
-                                client.clone(),
-                                server.clone(),
-                                Duration::from_millis(1_000),
-                                base_latency,
-                                base_jitter,
-                            );
-                            live_latency_state = Some(state);
-                            live_latency_task = Some(task);
-                            live_latency_stop = Some(stop_flag);
-                        }
+                        // keep behavior unchanged: live latency monitor was removed from this path.
                     }
                     engine::EngineStage::Upload => {
                         ui.render_phase("running upload test");
                         upload_progress =
                             Some(ui.begin_speed_progress("upload", effective_args.upload_seconds));
                         upload_last = None;
-
-                        if render_ui
-                            && live_latency_task.is_none()
-                            && let (Some(server_id), Some((base_latency, base_jitter))) =
-                                (selected_server_id, selected_latency)
-                            && let Some(server) = servers_by_id.get(&server_id)
-                        {
-                            let (state, task, stop_flag) = spawn_live_latency_monitor(
-                                client.clone(),
-                                server.clone(),
-                                Duration::from_millis(1_000),
-                                base_latency,
-                                base_jitter,
-                            );
-                            live_latency_state = Some(state);
-                            live_latency_task = Some(task);
-                            live_latency_stop = Some(stop_flag);
-                        }
                     }
                     engine::EngineStage::Save => {
                         ui.render_phase("building result payload");
@@ -361,8 +309,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                     variance_ms,
                 } => {
                     let stddev = variance_ms.max(0.0).sqrt();
-                    selected_latency = Some((average_ms, stddev));
-                    selected_server_id = Some(server_id);
                     let server_name = server_names
                         .get(&server_id)
                         .map(String::as_str)
@@ -379,22 +325,11 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                     bytes,
                     active_connections,
                 } => {
-                    let (latency_ms, jitter_ms) = live_latency_state
-                        .as_ref()
-                        .map(read_live_latency_snapshot)
-                        .map(|snapshot| (snapshot.latency_ms, snapshot.jitter_ms))
-                        .or_else(|| {
-                            selected_latency
-                                .map(|(latency, jitter)| (Some(latency), Some(jitter)))
-                        })
-                        .unwrap_or((None, None));
+                    let _ = active_connections;
                     let sample = ui::SpeedProgressSample {
                         elapsed,
                         mbps,
                         bytes,
-                        active_connections,
-                        latency_ms,
-                        jitter_ms,
                     };
                     match stage {
                         engine::EngineStage::Download => {
@@ -447,13 +382,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     ))
     .await;
 
-    if let Some(stop) = live_latency_stop.take() {
-        stop.store(true, Ordering::Relaxed);
-    }
-    if let Some(task) = live_latency_task.take() {
-        let _ = tokio::time::timeout(Duration::from_millis(900), task).await;
-    }
-
     let outcome = outcome?;
 
     let _ = (
@@ -489,91 +417,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn spawn_live_latency_monitor(
-    client: reqwest::Client,
-    server: speedtest::servers::SpeedtestServer,
-    interval: Duration,
-    initial_latency_ms: f64,
-    initial_jitter_ms: f64,
-) -> (
-    Arc<Mutex<LiveLatencySnapshot>>,
-    tokio::task::JoinHandle<()>,
-    Arc<AtomicBool>,
-) {
-    let state = Arc::new(Mutex::new(LiveLatencySnapshot {
-        latency_ms: Some(initial_latency_ms),
-        jitter_ms: Some(initial_jitter_ms),
-    }));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let task_state = Arc::clone(&state);
-    let task_stop = Arc::clone(&stop);
-    let task = tokio::spawn(async move {
-        let mut samples = VecDeque::new();
-        samples.push_back(initial_latency_ms);
-
-        while !task_stop.load(Ordering::Relaxed) {
-            let probe_result = tokio::time::timeout(
-                Duration::from_millis(1_500),
-                speedtest::select::probe_server_latency(&client, &server, 1),
-            )
-            .await;
-
-            if let Ok(Ok(measurement)) = probe_result {
-                let value = measurement.average_ms;
-                if value.is_finite() && value >= 0.0 {
-                    samples.push_back(value);
-                    while samples.len() > 16 {
-                        let _ = samples.pop_front();
-                    }
-
-                    let jitter = rolling_stddev_ms(&samples);
-                    if let Ok(mut guard) = task_state.lock() {
-                        guard.latency_ms = Some(value);
-                        guard.jitter_ms = jitter;
-                    }
-                }
-            }
-
-            tokio::time::sleep(interval).await;
-        }
-    });
-
-    (state, task, stop)
-}
-
-fn read_live_latency_snapshot(state: &Arc<Mutex<LiveLatencySnapshot>>) -> LiveLatencySnapshot {
-    state
-        .lock()
-        .map(|guard| *guard)
-        .unwrap_or(LiveLatencySnapshot {
-            latency_ms: None,
-            jitter_ms: None,
-        })
-}
-
-fn rolling_stddev_ms(samples: &VecDeque<f64>) -> Option<f64> {
-    if samples.len() < 2 {
-        return None;
-    }
-
-    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-    let variance = samples
-        .iter()
-        .map(|sample| {
-            let delta = sample - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / samples.len() as f64;
-
-    if variance.is_finite() {
-        Some(variance.max(0.0).sqrt())
-    } else {
-        None
-    }
 }
 
 async fn run_iperf(args: IperfArgs) -> Result<()> {
@@ -690,9 +533,6 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
                             elapsed: snapshot.elapsed,
                             mbps: snapshot.mbps,
                             bytes: snapshot.bytes,
-                            active_connections: args.parallel,
-                            latency_ms: None,
-                            jitter_ms: None,
                         },
                     );
                 }

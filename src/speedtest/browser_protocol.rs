@@ -568,7 +568,7 @@ fn parse_upload_stats_sample(text: &str) -> Option<UploadStatsSample> {
 pub async fn download(
     client: &Client,
     server: &SpeedtestServer,
-    guid: &str,
+    _guid: &str,
     size: usize,
 ) -> std::result::Result<u64, TransferRequestError> {
     let mut last_error = None;
@@ -576,11 +576,7 @@ pub async fn download(
     for mut url in
         endpoint_urls(server, "download").map_err(|_| TransferRequestError::InvalidEndpoint)?
     {
-        let nonce = next_nocache_token();
-        url.query_pairs_mut()
-            .append_pair("nocache", &nonce)
-            .append_pair("size", &size.to_string())
-            .append_pair("guid", guid);
+        url.query_pairs_mut().append_pair("size", &size.to_string());
 
         let response = match browser_headers(client.get(url.clone())).send().await {
             Ok(response) => response,
@@ -592,7 +588,23 @@ pub async fn download(
         };
 
         if !response.status().is_success() {
-            debug!(server_id = server.id, endpoint = %url, status = %response.status(), "download endpoint returned HTTP error");
+            let status = response.status();
+            match response.text().await {
+                Ok(body) => debug!(
+                    server_id = server.id,
+                    endpoint = %url,
+                    status = %status,
+                    response_body = %truncate_for_log(&body),
+                    "download endpoint returned HTTP error"
+                ),
+                Err(error) => debug!(
+                    server_id = server.id,
+                    endpoint = %url,
+                    status = %status,
+                    error = %error,
+                    "download endpoint returned HTTP error and response body unavailable"
+                ),
+            }
             last_error = Some(TransferRequestError::HttpStatus);
             continue;
         }
@@ -612,20 +624,13 @@ pub async fn download(
 pub async fn upload(
     client: &Client,
     server: &SpeedtestServer,
-    guid: &str,
+    _guid: &str,
     payload: Vec<u8>,
 ) -> std::result::Result<u64, TransferRequestError> {
     let body_len = payload.len() as u64;
     let mut last_error = None;
 
-    for mut url in
-        endpoint_urls(server, "upload").map_err(|_| TransferRequestError::InvalidEndpoint)?
-    {
-        let nonce = next_nocache_token();
-        url.query_pairs_mut()
-            .append_pair("nocache", &nonce)
-            .append_pair("guid", guid);
-
+    for url in endpoint_urls(server, "upload").map_err(|_| TransferRequestError::InvalidEndpoint)? {
         let response = match browser_headers(client.post(url.clone()))
             .header("Content-Type", "application/octet-stream")
             .body(payload.clone())
@@ -641,7 +646,23 @@ pub async fn upload(
         };
 
         if !response.status().is_success() {
-            debug!(server_id = server.id, endpoint = %url, status = %response.status(), "upload endpoint returned HTTP error");
+            let status = response.status();
+            match response.text().await {
+                Ok(body) => debug!(
+                    server_id = server.id,
+                    endpoint = %url,
+                    status = %status,
+                    response_body = %truncate_for_log(&body),
+                    "upload endpoint returned HTTP error"
+                ),
+                Err(error) => debug!(
+                    server_id = server.id,
+                    endpoint = %url,
+                    status = %status,
+                    error = %error,
+                    "upload endpoint returned HTTP error and response body unavailable"
+                ),
+            }
             last_error = Some(TransferRequestError::HttpStatus);
             continue;
         }
@@ -656,6 +677,22 @@ pub async fn upload(
     }
 
     Err(last_error.unwrap_or(TransferRequestError::InvalidEndpoint))
+}
+
+fn truncate_for_log(body: &str) -> String {
+    const MAX_LEN: usize = 1024;
+    if body.len() <= MAX_LEN {
+        return body.to_string();
+    }
+
+    let mut cutoff = MAX_LEN;
+    while !body.is_char_boundary(cutoff) {
+        cutoff = cutoff.saturating_sub(1);
+    }
+
+    let mut text = body[..cutoff].to_string();
+    text.push_str("...");
+    text
 }
 
 fn endpoint_urls(server: &SpeedtestServer, path: &str) -> Result<Vec<Url>> {

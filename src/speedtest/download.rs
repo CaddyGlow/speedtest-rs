@@ -4,14 +4,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use reqwest::Client;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::util::{clamp_worker_count, mbps_from_bytes};
+
+const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STAGE_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct DownloadStats {
@@ -81,50 +85,59 @@ where
             .collect::<Vec<_>>(),
     );
 
-    let workers = async {
-        match mode {
-            TransportProtocol::Xhr => {
-                run_download_workers_modern_sdk(
-                    client,
-                    &transfer_pool,
-                    &default_guid,
-                    worker_count,
-                    stop_at,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_http_errors,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                    &per_server_bytes,
-                )
-                .await;
-            }
-            TransportProtocol::Tcp => {
-                run_download_workers_modern(
-                    &transfer_pool,
-                    worker_count,
-                    stop_at,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                    &per_server_bytes,
-                )
-                .await;
-            }
-        }
-    };
-    tokio::pin!(workers);
+    let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
 
-    if let Some(interval) = progress_interval {
-        loop {
-            tokio::select! {
-                _ = &mut workers => break,
-                _ = sleep(interval) => {
+    let mut tasks = JoinSet::new();
+    match mode {
+        TransportProtocol::Xhr => run_download_workers_modern_sdk(
+            client,
+            &transfer_pool,
+            &default_guid,
+            worker_count,
+            stop_at,
+            &total_bytes,
+            &request_attempts,
+            &request_successes,
+            &request_http_errors,
+            &request_transport_errors,
+            &response_read_errors,
+            &active_connections,
+            &per_server_bytes,
+            &stage_stop_rx,
+            &mut tasks,
+        ),
+        TransportProtocol::Tcp => run_download_workers_modern(
+            &transfer_pool,
+            worker_count,
+            stop_at,
+            &total_bytes,
+            &request_attempts,
+            &request_successes,
+            &request_transport_errors,
+            &response_read_errors,
+            &active_connections,
+            &per_server_bytes,
+            &stage_stop_rx,
+            &mut tasks,
+        ),
+    }
+
+    let stage_deadline = sleep(stop_at.duration_since(start_at));
+    tokio::pin!(stage_deadline);
+    let poll_interval = progress_interval.unwrap_or(STAGE_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
+            _ = &mut stage_deadline => {
+                let _ = stage_stop_tx.send(true);
+                break;
+            }
+            _ = sleep(poll_interval) => {
+                if progress_interval.is_some() {
                     let elapsed = start_at.elapsed();
                     let elapsed_secs = elapsed.as_secs().max(1);
                     let bytes = total_bytes.load(Ordering::Relaxed);
@@ -137,8 +150,18 @@ where
                 }
             }
         }
-    } else {
-        workers.await;
+    }
+
+    let drained = timeout(STAGE_JOIN_GRACE_PERIOD, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tasks.abort_all();
+        let _ = timeout(STAGE_JOIN_GRACE_PERIOD, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     let bytes = total_bytes.load(Ordering::Relaxed);
@@ -179,7 +202,7 @@ fn normalize_server_pool(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_download_workers_modern(
+fn run_download_workers_modern(
     server_pool: &[SpeedtestServer],
     worker_count: usize,
     stop_at: Instant,
@@ -190,12 +213,13 @@ async fn run_download_workers_modern(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     per_server_bytes: &Arc<Vec<AtomicU64>>,
+    stop_rx: &watch::Receiver<bool>,
+    tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
         return;
     }
 
-    let mut tasks = JoinSet::new();
     for worker in 0..worker_count {
         let server_index = worker % server_pool.len();
         let worker_server = server_pool[server_index].clone();
@@ -206,19 +230,33 @@ async fn run_download_workers_modern(
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
         let worker_per_server_bytes = Arc::clone(per_server_bytes);
+        let mut worker_stop = stop_rx.clone();
         tasks.spawn(async move {
             const REQUEST_SIZE: usize = 25_000_000;
             let mut stream = None;
+            let mut stream_connected = false;
 
-            while Instant::now() < stop_at {
+            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
                 if stream.is_none() {
-                    match modern_protocol::connect(&worker_server).await {
-                        Ok(connected) => {
+                    let maybe_connected = tokio::select! {
+                        connected = modern_protocol::connect(&worker_server) => Some(connected),
+                        _ = worker_stop.changed() => None,
+                    };
+
+                    match maybe_connected {
+                        Some(Ok(connected)) => {
                             stream = Some(connected);
+                            if !stream_connected {
+                                worker_active_connections.fetch_add(1, Ordering::Relaxed);
+                                stream_connected = true;
+                            }
                         }
-                        Err(_) => {
+                        Some(Err(_)) => {
                             worker_transport_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
+                        }
+                        None => {
+                            break;
                         }
                     }
                 }
@@ -229,33 +267,43 @@ async fn run_download_workers_modern(
                     continue;
                 };
 
-                let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
+                let maybe_downloaded = tokio::select! {
+                    downloaded = modern_protocol::download(active_stream, REQUEST_SIZE) => Some(downloaded),
+                    _ = worker_stop.changed() => None,
+                };
 
-                match modern_protocol::download(active_stream, REQUEST_SIZE).await {
-                    Ok(downloaded) => {
+                match maybe_downloaded {
+                    Some(Ok(downloaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
                         worker_per_server_bytes[server_index]
                             .fetch_add(downloaded, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         worker_read_errors.fetch_add(1, Ordering::Relaxed);
                         stream = None;
+                        if stream_connected {
+                            worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+                            stream_connected = false;
+                        }
                     }
+                    None => break,
                 }
             }
 
             if let Some(mut active_stream) = stream {
                 let _ = modern_protocol::quit(&mut active_stream).await;
             }
+
+            if stream_connected {
+                worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+            }
         });
     }
-
-    while tasks.join_next().await.is_some() {}
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_download_workers_modern_sdk(
+fn run_download_workers_modern_sdk(
     client: &Client,
     server_pool: &[SpeedtestServer],
     default_guid: &str,
@@ -269,12 +317,12 @@ async fn run_download_workers_modern_sdk(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     per_server_bytes: &Arc<Vec<AtomicU64>>,
+    stop_rx: &watch::Receiver<bool>,
+    tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
         return;
     }
-
-    let mut tasks = JoinSet::new();
 
     for worker in 0..worker_count {
         let worker_client = client.clone();
@@ -293,29 +341,33 @@ async fn run_download_workers_modern_sdk(
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
         let worker_per_server_bytes = Arc::clone(per_server_bytes);
+        let mut worker_stop = stop_rx.clone();
         tasks.spawn(async move {
             const REQUEST_SIZE: usize = 25_000_000;
 
-            while Instant::now() < stop_at {
+            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
                 worker_attempts.fetch_add(1, Ordering::Relaxed);
 
                 let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
 
-                match browser_protocol::download(
-                    &worker_client,
-                    &worker_server,
-                    &worker_guid,
-                    REQUEST_SIZE,
-                )
-                .await
-                {
-                    Ok(downloaded) => {
+                let maybe_downloaded = tokio::select! {
+                    downloaded = browser_protocol::download(
+                        &worker_client,
+                        &worker_server,
+                        &worker_guid,
+                        REQUEST_SIZE,
+                    ) => Some(downloaded),
+                    _ = worker_stop.changed() => None,
+                };
+
+                match maybe_downloaded {
+                    Some(Ok(downloaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
                         worker_per_server_bytes[server_index]
                             .fetch_add(downloaded, Ordering::Relaxed);
                     }
-                    Err(error) => match error {
+                    Some(Err(error)) => match error {
                         browser_protocol::TransferRequestError::HttpStatus => {
                             worker_http_errors.fetch_add(1, Ordering::Relaxed);
                         }
@@ -327,12 +379,11 @@ async fn run_download_workers_modern_sdk(
                             worker_read_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     },
+                    None => break,
                 }
             }
         });
     }
-
-    while tasks.join_next().await.is_some() {}
 }
 
 struct ActiveConnectionGuard<'a> {
@@ -349,5 +400,159 @@ impl<'a> ActiveConnectionGuard<'a> {
 impl Drop for ActiveConnectionGuard<'_> {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::Ipv4Addr;
+
+    use anyhow::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+    use tokio::time::{Duration, Instant, sleep, timeout};
+
+    fn download_test_server(port: u16) -> SpeedtestServer {
+        SpeedtestServer {
+            id: 11,
+            sponsor: "unit-test".to_string(),
+            name: "local".to_string(),
+            country: "local".to_string(),
+            host: format!("127.0.0.1:{port}"),
+            distance_km: 1.0,
+            url: format!("http://127.0.0.1:{port}/").to_string(),
+            session_guid: None,
+            sdk_lat: None,
+            sdk_lon: None,
+            sdk_cc: None,
+            sdk_preferred: None,
+            sdk_isp_id: None,
+            sdk_https_functional: None,
+            sdk_hostname: None,
+            sdk_port: None,
+            sdk_force_ping_select: None,
+        }
+    }
+
+    async fn read_line(stream: &mut TcpStream) -> anyhow::Result<String> {
+        let mut line = String::new();
+        let mut buf = [0_u8; 1];
+        loop {
+            let read = stream
+                .read(&mut buf)
+                .await
+                .context("failed reading command")?;
+            if read == 0 {
+                anyhow::bail!("client closed before sending request line");
+            }
+
+            if buf[0] == b'\n' {
+                break;
+            }
+
+            if buf[0] != b'\r' {
+                line.push(buf[0] as char);
+                if line.len() > 64 {
+                    anyhow::bail!("command line exceeded expected limit");
+                }
+            }
+        }
+
+        Ok(line)
+    }
+
+    async fn handle_slow_download(mut stream: TcpStream, mut stop: watch::Receiver<bool>) {
+        let _ = read_line(&mut stream).await;
+
+        loop {
+            if *stop.borrow_and_update() {
+                break;
+            }
+
+            if stream.write_all(&[0x44]).await.is_err() {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn spawn_slow_download_server()
+    -> anyhow::Result<(u16, watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind download server")?;
+        let port = listener.local_addr().context("read server port")?.port();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+
+                        if *stop_rx.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            continue;
+                        };
+
+                        let stop = stop_rx.clone();
+                        tokio::spawn(async move {
+                            handle_slow_download(stream, stop).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok((port, stop_tx, handle))
+    }
+
+    #[tokio::test]
+    async fn tcp_download_stage_honors_stop_deadline() -> anyhow::Result<()> {
+        let (port, stop_tx, server_handle) = spawn_slow_download_server()
+            .await
+            .context("start slow download test server")?;
+
+        let server = download_test_server(port);
+        let client = reqwest::Client::new();
+        let start = Instant::now();
+
+        let result = timeout(
+            Duration::from_secs(3),
+            run_download_test(
+                &client,
+                &server,
+                TransportProtocol::Tcp,
+                std::slice::from_ref(&server),
+                1,
+                1,
+                None,
+                |_| {},
+            ),
+        )
+        .await
+        .context("download run must finish inside timeout")?;
+
+        let stats = result.context("download stage must succeed")?;
+
+        stop_tx.send_replace(true);
+        let _ = timeout(Duration::from_millis(300), server_handle).await;
+
+        assert!(
+            start.elapsed() < Duration::from_millis(1800),
+            "download stage should stop near target duration"
+        );
+        assert_eq!(stats.bytes, 0);
+
+        Ok(())
     }
 }

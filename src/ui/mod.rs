@@ -12,9 +12,6 @@ pub struct SpeedProgressSample {
     pub elapsed: Duration,
     pub mbps: f64,
     pub bytes: u64,
-    pub active_connections: usize,
-    pub latency_ms: Option<f64>,
-    pub jitter_ms: Option<f64>,
 }
 
 pub struct Ui {

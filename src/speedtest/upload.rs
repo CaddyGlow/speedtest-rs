@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use reqwest::Client;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::debug;
@@ -19,6 +20,8 @@ const REMOTE_STATS_SAMPLE_INTERVAL_MS: u64 = 250;
 const REMOTE_STATS_JOIN_WAIT_MS: u64 = 3_500;
 const REMOTE_STATS_BACKGROUND_UPLOAD_BYTES: usize = 32 * 1024;
 const REMOTE_STATS_BACKGROUND_UPLOAD_INTERVAL_MS: u64 = 500;
+const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STAGE_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct UploadStats {
@@ -80,6 +83,7 @@ where
     let mut upload_stats_rx = None;
     let mut latest_remote_sample = None;
     let mut remote_samples = Vec::new();
+    let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
 
     if matches!(mode, TransportProtocol::Xhr)
         && let Some(guid) = selected_server
@@ -129,52 +133,56 @@ where
         upload_stats_rx = Some(rx);
     }
 
-    let workers = async {
-        match mode {
-            TransportProtocol::Xhr => {
-                run_upload_workers_modern_sdk(
-                    client,
-                    &transfer_pool,
-                    &default_guid,
-                    worker_count,
-                    stop_at,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_http_errors,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                )
-                .await;
-            }
-            TransportProtocol::Tcp => {
-                run_upload_workers_modern(
-                    &transfer_pool,
-                    worker_count,
-                    stop_at,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                )
-                .await;
-            }
+    let mut tasks = JoinSet::new();
+    match mode {
+        TransportProtocol::Xhr => {
+            run_upload_workers_modern_sdk(
+                client,
+                &transfer_pool,
+                &default_guid,
+                worker_count,
+                stop_at,
+                &total_bytes,
+                &request_attempts,
+                &request_successes,
+                &request_http_errors,
+                &request_transport_errors,
+                &response_read_errors,
+                &active_connections,
+                &stage_stop_rx,
+                &mut tasks,
+            );
         }
-        Ok::<(), anyhow::Error>(())
-    };
-    tokio::pin!(workers);
+        TransportProtocol::Tcp => {
+            run_upload_workers_modern(
+                &transfer_pool,
+                worker_count,
+                stop_at,
+                &total_bytes,
+                &request_attempts,
+                &request_successes,
+                &request_transport_errors,
+                &response_read_errors,
+                &active_connections,
+                &stage_stop_rx,
+                &mut tasks,
+            );
+        }
+    }
 
-    if let Some(interval) = progress_interval {
-        loop {
-            tokio::select! {
-                result = &mut workers => {
-                    result?;
+    let stage_deadline = sleep(stop_at.duration_since(start_at));
+    tokio::pin!(stage_deadline);
+    let poll_interval = progress_interval.unwrap_or(STAGE_POLL_INTERVAL);
+
+    loop {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                if joined.is_none() {
                     break;
                 }
-                _ = sleep(interval) => {
+            }
+            _ = sleep(poll_interval) => {
+                if progress_interval.is_some() {
                     if let Some(rx) = upload_stats_rx.as_mut() {
                         while let Ok(sample) = rx.try_recv() {
                             latest_remote_sample = Some(sample);
@@ -199,9 +207,23 @@ where
                     });
                 }
             }
+            _ = &mut stage_deadline => {
+                let _ = stage_stop_tx.send(true);
+                break;
+            }
         }
-    } else {
-        workers.await?;
+    }
+
+    let drained = timeout(STAGE_JOIN_GRACE_PERIOD, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tasks.abort_all();
+        let _ = timeout(STAGE_JOIN_GRACE_PERIOD, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     if let Some(rx) = upload_stats_rx.as_mut() {
@@ -319,7 +341,7 @@ fn normalize_server_pool(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_upload_workers_modern(
+fn run_upload_workers_modern(
     server_pool: &[SpeedtestServer],
     worker_count: usize,
     stop_at: Instant,
@@ -329,12 +351,13 @@ async fn run_upload_workers_modern(
     request_transport_errors: &Arc<AtomicU64>,
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
+    stop_rx: &watch::Receiver<bool>,
+    tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
         return;
     }
 
-    let mut tasks = JoinSet::new();
     for worker in 0..worker_count {
         let worker_server = server_pool[worker % server_pool.len()].clone();
         let worker_bytes = Arc::clone(total_bytes);
@@ -343,20 +366,34 @@ async fn run_upload_workers_modern(
         let worker_transport_errors = Arc::clone(request_transport_errors);
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
+        let mut worker_stop = stop_rx.clone();
 
         tasks.spawn(async move {
             const REQUEST_SIZE: usize = 25_000_000;
             let mut stream = None;
+            let mut stream_connected = false;
 
-            while Instant::now() < stop_at {
+            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
                 if stream.is_none() {
-                    match modern_protocol::connect(&worker_server).await {
-                        Ok(connected) => {
+                    let maybe_connected = tokio::select! {
+                        connected = modern_protocol::connect(&worker_server) => Some(connected),
+                        _ = worker_stop.changed() => None,
+                    };
+
+                    match maybe_connected {
+                    Some(Ok(connected)) => {
                             stream = Some(connected);
+                            if !stream_connected {
+                                worker_active_connections.fetch_add(1, Ordering::Relaxed);
+                                stream_connected = true;
+                            }
                         }
-                        Err(_) => {
+                        Some(Err(_)) => {
                             worker_transport_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
+                        }
+                        None => {
+                            break;
                         }
                     }
                 }
@@ -367,31 +404,41 @@ async fn run_upload_workers_modern(
                     continue;
                 };
 
-                let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
+                let maybe_uploaded = tokio::select! {
+                    uploaded = modern_protocol::upload(active_stream, REQUEST_SIZE) => Some(uploaded),
+                    _ = worker_stop.changed() => None,
+                };
 
-                match modern_protocol::upload(active_stream, REQUEST_SIZE).await {
-                    Ok(uploaded) => {
+                match maybe_uploaded {
+                    Some(Ok(uploaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(uploaded, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         worker_read_errors.fetch_add(1, Ordering::Relaxed);
                         stream = None;
+                        if stream_connected {
+                            worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+                            stream_connected = false;
+                        }
                     }
+                    None => break,
                 }
             }
 
             if let Some(mut active_stream) = stream {
                 let _ = modern_protocol::quit(&mut active_stream).await;
             }
+
+            if stream_connected {
+                worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+            }
         });
     }
-
-    while tasks.join_next().await.is_some() {}
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_upload_workers_modern_sdk(
+fn run_upload_workers_modern_sdk(
     client: &Client,
     server_pool: &[SpeedtestServer],
     default_guid: &str,
@@ -404,12 +451,12 @@ async fn run_upload_workers_modern_sdk(
     request_transport_errors: &Arc<AtomicU64>,
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
+    stop_rx: &watch::Receiver<bool>,
+    tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
         return;
     }
-
-    let mut tasks = JoinSet::new();
 
     for worker in 0..worker_count {
         let worker_client = client.clone();
@@ -426,6 +473,7 @@ async fn run_upload_workers_modern_sdk(
         let worker_transport_errors = Arc::clone(request_transport_errors);
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
+        let mut worker_stop = stop_rx.clone();
 
         tasks.spawn(async move {
             const SIZES: [usize; 5] = [
@@ -437,26 +485,29 @@ async fn run_upload_workers_modern_sdk(
             ];
             let mut cursor = worker % SIZES.len();
 
-            while Instant::now() < stop_at {
+            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
                 let size = SIZES[cursor];
                 cursor = (cursor + 1) % SIZES.len();
                 worker_attempts.fetch_add(1, Ordering::Relaxed);
 
                 let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
 
-                match browser_protocol::upload(
-                    &worker_client,
-                    &worker_server,
-                    &worker_guid,
-                    vec![0x42_u8; size],
-                )
-                .await
-                {
-                    Ok(uploaded) => {
+                let maybe_uploaded = tokio::select! {
+                    uploaded = browser_protocol::upload(
+                        &worker_client,
+                        &worker_server,
+                        &worker_guid,
+                        vec![0x42_u8; size],
+                    ) => Some(uploaded),
+                    _ = worker_stop.changed() => None,
+                };
+
+                match maybe_uploaded {
+                    Some(Ok(uploaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(uploaded, Ordering::Relaxed);
                     }
-                    Err(error) => match error {
+                    Some(Err(error)) => match error {
                         browser_protocol::TransferRequestError::HttpStatus => {
                             worker_http_errors.fetch_add(1, Ordering::Relaxed);
                         }
@@ -468,12 +519,11 @@ async fn run_upload_workers_modern_sdk(
                             worker_read_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     },
+                    None => break,
                 }
             }
         });
     }
-
-    while tasks.join_next().await.is_some() {}
 }
 
 struct ActiveConnectionGuard<'a> {
@@ -537,5 +587,165 @@ async fn run_remote_stats_background_upload(
             REMOTE_STATS_BACKGROUND_UPLOAD_INTERVAL_MS,
         ))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::Ipv4Addr;
+
+    use anyhow::Context;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+    use tokio::time::{Duration, Instant, sleep, timeout};
+
+    fn upload_test_server(port: u16) -> SpeedtestServer {
+        SpeedtestServer {
+            id: 17,
+            sponsor: "unit-test".to_string(),
+            name: "local".to_string(),
+            country: "local".to_string(),
+            host: format!("127.0.0.1:{port}"),
+            distance_km: 1.0,
+            url: format!("http://127.0.0.1:{port}/").to_string(),
+            session_guid: None,
+            sdk_lat: None,
+            sdk_lon: None,
+            sdk_cc: None,
+            sdk_preferred: None,
+            sdk_isp_id: None,
+            sdk_https_functional: None,
+            sdk_hostname: None,
+            sdk_port: None,
+            sdk_force_ping_select: None,
+        }
+    }
+
+    async fn read_line(stream: &mut TcpStream) -> anyhow::Result<String> {
+        let mut line = String::new();
+        let mut buf = [0_u8; 1];
+        loop {
+            let read = stream
+                .read(&mut buf)
+                .await
+                .context("failed reading command")?;
+            if read == 0 {
+                anyhow::bail!("client closed before sending request line");
+            }
+
+            if buf[0] == b'\n' {
+                break;
+            }
+
+            if buf[0] != b'\r' {
+                line.push(buf[0] as char);
+                if line.len() > 64 {
+                    anyhow::bail!("command line exceeded expected limit");
+                }
+            }
+        }
+
+        Ok(line)
+    }
+
+    async fn handle_slow_upload(mut stream: TcpStream, mut stop: watch::Receiver<bool>) {
+        let _ = read_line(&mut stream).await;
+        let mut payload = [0_u8; 1024];
+
+        loop {
+            if *stop.borrow_and_update() {
+                break;
+            }
+
+            if let Ok(read) = stream.read(&mut payload).await {
+                if read == 0 {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn spawn_slow_upload_server()
+    -> anyhow::Result<(u16, watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind upload server")?;
+        let port = listener.local_addr().context("read server port")?.port();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+
+                        if *stop_rx.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            continue;
+                        };
+
+                        let stop = stop_rx.clone();
+                        tokio::spawn(async move {
+                            handle_slow_upload(stream, stop).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok((port, stop_tx, handle))
+    }
+
+    #[tokio::test]
+    async fn tcp_upload_stage_honors_stop_deadline() -> anyhow::Result<()> {
+        let (port, stop_tx, server_handle) = spawn_slow_upload_server()
+            .await
+            .context("start slow upload test server")?;
+
+        let server = upload_test_server(port);
+        let client = reqwest::Client::new();
+        let start = Instant::now();
+
+        let result = timeout(
+            Duration::from_secs(3),
+            run_upload_test(
+                &client,
+                &server,
+                TransportProtocol::Tcp,
+                std::slice::from_ref(&server),
+                1,
+                1,
+                None,
+                |_| {},
+            ),
+        )
+        .await
+        .context("upload run must finish inside timeout")?;
+
+        let stats = result.context("upload stage must succeed")?;
+
+        stop_tx.send_replace(true);
+        let _ = timeout(Duration::from_millis(300), server_handle).await;
+
+        assert!(
+            start.elapsed() < Duration::from_millis(1800),
+            "upload stage should stop near target duration"
+        );
+        assert_eq!(stats.bytes, 0);
+
+        Ok(())
     }
 }

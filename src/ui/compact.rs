@@ -21,7 +21,6 @@ pub struct SpeedProgressBar {
     phase: String,
     total_seconds: u64,
     bar: ProgressBar,
-    gauge_ceiling_mbps: Cell<f64>,
     last_sample_bytes: Cell<u64>,
     last_sample_elapsed_nanos: Cell<u128>,
     last_non_zero_mbps: Cell<f64>,
@@ -91,7 +90,6 @@ impl CompactUi {
             phase: phase.to_string(),
             total_seconds,
             bar,
-            gauge_ceiling_mbps: Cell::new(100.0),
             last_sample_bytes: Cell::new(0),
             last_sample_elapsed_nanos: Cell::new(0),
             last_non_zero_mbps: Cell::new(0.0),
@@ -123,24 +121,10 @@ impl CompactUi {
         progress
             .last_sample_elapsed_nanos
             .set(sample.elapsed.as_nanos());
-        let ceiling_mbps = ensure_gauge_ceiling(progress, mbps);
-        let speed_gauge = format_speed_gauge(mbps, ceiling_mbps);
-        let latency_label = sample
-            .latency_ms
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .map(|value| format!(" {value:.2}ms"))
-            .unwrap_or_default();
-        let jitter_label = sample
-            .jitter_ms
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .map(|value| format!(" j{value:.2}"))
-            .unwrap_or_default();
         progress.bar.set_prefix(format!(
-            "{:7.2} Mbps {} {:.1} MB {} conn{latency_label}{jitter_label}",
+            "{:7.2} Mbps {:.1} MB",
             mbps,
-            speed_gauge,
             sample.bytes as f64 / 1_000_000.0,
-            sample.active_connections,
         ));
     }
 
@@ -160,56 +144,6 @@ impl CompactUi {
         }
         self.phase.finish_and_clear();
     }
-}
-
-fn ensure_gauge_ceiling(progress: &SpeedProgressBar, mbps: f64) -> f64 {
-    let current = progress.gauge_ceiling_mbps.get().max(10.0);
-    if mbps <= current {
-        return current;
-    }
-
-    let next = gauge_ceiling_for_speed(mbps);
-    progress.gauge_ceiling_mbps.set(next);
-    next
-}
-
-fn gauge_ceiling_for_speed(mbps: f64) -> f64 {
-    const GAUGE_BUCKETS: [f64; 9] = [
-        10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0,
-    ];
-
-    for bucket in GAUGE_BUCKETS {
-        if mbps <= bucket {
-            return bucket;
-        }
-    }
-
-    mbps.ceil()
-}
-
-fn format_speed_gauge(mbps: f64, ceiling_mbps: f64) -> String {
-    const GAUGE_WIDTH: usize = 12;
-
-    let ratio = if ceiling_mbps > 0.0 {
-        (mbps / ceiling_mbps).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let filled = (ratio * GAUGE_WIDTH as f64).round() as usize;
-
-    let mut gauge = String::with_capacity(GAUGE_WIDTH + 12);
-    gauge.push('[');
-    for idx in 0..GAUGE_WIDTH {
-        if idx < filled {
-            gauge.push('=');
-        } else {
-            gauge.push('.');
-        }
-    }
-    gauge.push(']');
-    gauge.push('@');
-    gauge.push_str(&format!("{ceiling_mbps:.0}"));
-    gauge
 }
 
 fn estimate_interval_mbps(
@@ -249,20 +183,7 @@ fn estimate_interval_mbps(
 
 #[cfg(test)]
 mod tests {
-    use super::{estimate_interval_mbps, format_speed_gauge, gauge_ceiling_for_speed};
-
-    #[test]
-    fn speed_gauge_ceiling_uses_next_bucket() {
-        assert_eq!(gauge_ceiling_for_speed(18.0), 25.0);
-        assert_eq!(gauge_ceiling_for_speed(500.0), 500.0);
-        assert_eq!(gauge_ceiling_for_speed(6400.4), 6401.0);
-    }
-
-    #[test]
-    fn speed_gauge_formats_ascii_bar() {
-        let gauge = format_speed_gauge(50.0, 100.0);
-        assert_eq!(gauge, "[======......]@100");
-    }
+    use super::estimate_interval_mbps;
 
     #[test]
     fn estimate_interval_speed_uses_byte_delta() {
