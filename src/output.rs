@@ -9,69 +9,77 @@ use crate::model::RunResult;
 pub fn print_human(result: &RunResult) {
     let theme = Theme::detect();
 
-    println!("{}", theme.section("Speedtest Result"));
+    println!("{}", theme.section("=== Speedtest Result ==="));
     println!(
-        "{} {}",
-        theme.key("timestamp:"),
+        "{}  {}",
+        theme.key("timestamp"),
         theme.muted(&result.timestamp)
     );
 
     if let Some(api) = result.speedtest_api.as_deref() {
-        println!("{} {}", theme.key("mode:"), theme.paint(api, "35"));
+        println!("{}       {}", theme.key("mode"), theme.paint(api, "1;35"));
     }
+    println!();
 
     if let Some(server) = &result.server {
-        let latency = match (server.latency_ms, server.latency_stddev_ms) {
-            (Some(avg), Some(std)) => format!(
-                "avg={} std={}",
-                theme.paint(&format!("{avg:.2}ms"), latency_color(avg)),
-                theme.muted(&format!("{std:.2}ms"))
-            ),
-            (Some(avg), None) => theme.paint(&format!("avg={avg:.2}ms"), latency_color(avg)),
-            _ => "n/a".to_string(),
-        };
-
+        println!("{}", theme.section("Server"));
         println!(
-            "{} {} ({}, {}, {}, host={}, distance={}, latency={})",
-            theme.key("server:"),
+            "  {} {} ({})",
+            theme.key("id"),
             theme.paint(&server.id.to_string(), "1;37"),
-            server.sponsor,
-            server.name,
-            server.country,
-            server.host,
-            theme.muted(&format!("{:.2} km", server.distance_km)),
-            latency,
+            server.sponsor
         );
+        println!("  {} {}", theme.key("location"), server.name);
+        println!("  {} {}", theme.key("country"), server.country);
+        println!("  {} {}", theme.key("host"), server.host);
+        println!(
+            "  {} {}",
+            theme.key("distance"),
+            theme.muted(&format!("{:.2} km", server.distance_km))
+        );
+        if let Some(avg) = server.latency_ms {
+            let stddev = server
+                .latency_stddev_ms
+                .map(|value| format!(" (std {})", theme.muted(&format!("{value:.2}ms"))))
+                .unwrap_or_default();
+            println!(
+                "  {} {}{}",
+                theme.key("latency"),
+                theme.paint(&format!("{avg:.2}ms"), latency_color(avg)),
+                stddev
+            );
+        }
     } else {
-        println!("{} {}", theme.key("server:"), theme.muted("not selected"));
+        println!("{} {}", theme.key("server"), theme.muted("not selected"));
     }
+    println!();
 
     if let Some(pool) = &result.server_pool
         && !pool.is_empty()
     {
         println!(
             "{} {}",
-            theme.key("server_pool:"),
-            theme.muted(&format!("{} servers", pool.len()))
+            theme.section("Server Pool"),
+            theme.muted(&format!("({})", pool.len()))
         );
         for server in pool {
             let latency = match (server.latency_ms, server.latency_stddev_ms) {
                 (Some(avg), Some(std)) => {
-                    format!("avg={avg:.2}ms std={std:.2}ms")
+                    format!("lat {avg:.2}ms (std {std:.2}ms)")
                 }
-                (Some(avg), None) => format!("avg={avg:.2}ms"),
-                _ => "n/a".to_string(),
+                (Some(avg), None) => format!("lat {avg:.2}ms"),
+                _ => "lat n/a".to_string(),
             };
             let download = match (server.download_avg_mbps, server.download_bytes) {
                 (Some(mbps), Some(bytes)) => format!(
-                    "avg={} bytes={}",
+                    "dl {} / {}",
                     theme.paint(&format!("{mbps:.2}Mbps"), throughput_color(mbps)),
                     theme.muted(&format_bytes(bytes))
                 ),
-                _ => "n/a".to_string(),
+                _ => "dl n/a".to_string(),
             };
             println!(
-                "  - id={} name={} host={} latency={} download={}",
+                "  - id={} {:<14} {:<26} | {} | {}",
                 theme.paint(&server.id.to_string(), "1;37"),
                 server.name,
                 server.host,
@@ -79,31 +87,35 @@ pub fn print_human(result: &RunResult) {
                 download
             );
         }
+        println!();
     }
 
     if let Some(client) = &result.client {
+        println!("{}", theme.section("Client"));
+        println!("  {} {}", theme.key("ip"), client.ip,);
+        println!("  {} {}", theme.key("isp"), client.isp,);
+        println!("  {} {}", theme.key("country"), client.country,);
         println!(
-            "{} ip={} isp={} country={} location={:.4},{:.4}",
-            theme.key("client:"),
-            client.ip,
-            client.isp,
-            client.country,
+            "  {} {:.4},{:.4}",
+            theme.key("location"),
             client.latitude,
             client.longitude
         );
+        println!();
     }
 
+    println!("{}", theme.section("Results"));
     if let Some(ping) = result.ping_ms {
         println!(
-            "{} {}",
-            theme.key("ping:"),
+            "  {} {}",
+            theme.badge("PING", latency_color(ping)),
             theme.paint(&format!("{ping:.2} ms"), latency_color(ping))
         );
     }
     if let Some(download) = &result.download {
         println!(
-            "{} {} ({}, {}s, workers={})",
-            theme.key("download:"),
+            "  {} {}  {} in {}s ({} workers)",
+            theme.badge("DOWN", throughput_color(download.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", download.mbps),
                 throughput_color(download.mbps)
@@ -115,8 +127,8 @@ pub fn print_human(result: &RunResult) {
     }
     if let Some(upload) = &result.upload {
         println!(
-            "{} {} ({}, {}s, workers={})",
-            theme.key("upload:"),
+            "  {} {}  {} in {}s ({} workers)",
+            theme.badge("UP", throughput_color(upload.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", upload.mbps),
                 throughput_color(upload.mbps)
@@ -127,8 +139,8 @@ pub fn print_human(result: &RunResult) {
         );
     }
     println!(
-        "{} {}",
-        theme.key("proxy:"),
+        "  {} {}",
+        theme.key("proxy"),
         result
             .proxy
             .as_deref()
@@ -249,6 +261,10 @@ impl Theme {
 
     fn muted(&self, text: &str) -> String {
         self.paint(text, "2")
+    }
+
+    fn badge(&self, text: &str, color: &str) -> String {
+        self.paint(&format!("[{text}]"), color)
     }
 }
 

@@ -2,9 +2,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
 use crate::cli::{CacheCommand, Cli, Command, IperfArgs, IperfProtocol, RunArgs};
@@ -816,6 +817,5 @@ where
 }
 
 fn current_timestamp() -> Result<String> {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(timestamp.to_string())
+    Ok(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
 }
