@@ -1,13 +1,12 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
-use crate::speedtest::api::{ModernTransportMode, SpeedtestApiMode};
+use crate::speedtest::api::ModernTransportMode;
 
 const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TuiMode {
     Compact,
-    Fullscreen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -51,13 +50,9 @@ pub struct CacheArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
-    /// Speedtest API backend mode
-    #[arg(long, default_value = "auto")]
-    pub speedtest_api: SpeedtestApiMode,
-
-    /// Transport mode when using --speedtest-api modern
-    #[arg(long, default_value = "xhr")]
-    pub modern_mode: ModernTransportMode,
+    /// Speedtest transfer transport mode
+    #[arg(long = "mode", default_value = "xhr")]
+    pub mode: ModernTransportMode,
 
     /// Optional server id override
     #[arg(long)]
@@ -67,9 +62,9 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub candidate_servers: usize,
 
-    /// Number of servers to include in modern API transfer pool
-    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
-    pub modern_pool_size: usize,
+    /// Number of servers to include in transfer pool
+    #[arg(long = "pool-size", default_value_t = 4, value_parser = parse_positive_usize)]
+    pub pool_size: usize,
 
     /// Number of latency samples per candidate server
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
@@ -220,11 +215,10 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             command: Some(Command::Run(RunArgs {
-                speedtest_api: SpeedtestApiMode::Auto,
-                modern_mode: ModernTransportMode::Xhr,
+                mode: ModernTransportMode::Xhr,
                 server_id: None,
                 candidate_servers: 10,
-                modern_pool_size: 4,
+                pool_size: 4,
                 latency_samples: 10,
                 download_connections: 8,
                 upload_connections: 8,
@@ -315,52 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_speedtest_api_mode() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--speedtest-api", "modern"])
-            .expect("run --speedtest-api modern should parse");
-
-        let Some(Command::Run(args)) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert!(matches!(
-            args.speedtest_api,
-            super::SpeedtestApiMode::Modern
-        ));
-    }
-
-    #[test]
-    fn parses_speedtest_api_mode_modern_tcp() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--speedtest-api", "modern-tcp"])
-            .expect("run --speedtest-api modern-tcp should parse");
-
-        let Some(Command::Run(args)) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert!(matches!(
-            args.speedtest_api,
-            super::SpeedtestApiMode::ModernTcp
-        ));
-    }
-
-    #[test]
     fn parses_modern_transport_mode() {
-        let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
-            "run",
-            "--speedtest-api",
-            "modern",
-            "--modern-mode",
-            "tcp",
-        ])
-        .expect("run --speedtest-api modern --modern-mode tcp should parse");
+        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--mode", "tcp"])
+            .expect("run --mode tcp should parse");
 
         let Some(Command::Run(args)) = cli.command else {
             panic!("expected run command");
         };
 
-        assert!(matches!(args.modern_mode, super::ModernTransportMode::Tcp));
+        assert!(matches!(args.mode, super::ModernTransportMode::Tcp));
     }
 
     #[test]
@@ -387,9 +344,8 @@ mod tests {
             panic!("expected run command");
         };
 
-        assert!(matches!(args.speedtest_api, super::SpeedtestApiMode::Auto));
-        assert!(matches!(args.modern_mode, super::ModernTransportMode::Xhr));
-        assert_eq!(args.modern_pool_size, 4);
+        assert!(matches!(args.mode, super::ModernTransportMode::Xhr));
+        assert_eq!(args.pool_size, 4);
     }
 
     #[test]

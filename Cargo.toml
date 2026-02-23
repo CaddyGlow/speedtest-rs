@@ -8,11 +8,9 @@ description = "Standalone Speedtest.net CLI/TUI with proxy support"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
 futures-util = "0.3"
 indicatif = "0.17"
 md5 = "0.7"
-ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "socks"] }
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }

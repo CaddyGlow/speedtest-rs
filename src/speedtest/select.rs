@@ -1,19 +1,21 @@
 use std::cmp::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
-use crate::speedtest::api::ResolvedSpeedtestApi;
 use crate::speedtest::browser_protocol;
-use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 
+#[allow(dead_code)]
 const LOADED_LATENCY_WORKERS: usize = 2;
+#[allow(dead_code)]
 const LOADED_LATENCY_MAX_SAMPLES_PER_SEC: usize = 25;
+#[allow(dead_code)]
 const LOADED_LATENCY_OUTLIER_LOWER_QUANTILE: f64 = 0.01;
+#[allow(dead_code)]
 const LOADED_LATENCY_OUTLIER_UPPER_QUANTILE: f64 = 0.99;
 
 #[derive(Debug, Clone)]
@@ -45,7 +47,6 @@ pub fn select_nearest(servers: &[SpeedtestServer], count: usize) -> Vec<Speedtes
 pub async fn probe_and_rank_candidates_with_progress<F>(
     client: &Client,
     servers: &[SpeedtestServer],
-    api: ResolvedSpeedtestApi,
     candidate_count: usize,
     latency_samples: usize,
     mut on_probe: F,
@@ -65,7 +66,7 @@ where
     let mut scored = Vec::new();
     let total_candidates = candidates.len();
     for (index, server) in candidates.into_iter().enumerate() {
-        match probe_server_latency_detailed(client, &server, latency_samples, api).await {
+        match probe_server_latency_detailed(client, &server, latency_samples).await {
             Ok(measurement) => {
                 on_probe(
                     index + 1,
@@ -105,75 +106,42 @@ pub async fn probe_server_latency(
     client: &Client,
     server: &SpeedtestServer,
     samples: usize,
-    api: ResolvedSpeedtestApi,
 ) -> Result<LatencyMeasurement> {
-    probe_server_latency_detailed(client, server, samples, api).await
+    probe_server_latency_detailed(client, server, samples).await
 }
 
+#[allow(dead_code)]
 pub async fn collect_loaded_latency_samples(
     client: &Client,
     server: &SpeedtestServer,
-    api: ResolvedSpeedtestApi,
     stage_seconds: u64,
 ) -> Vec<f64> {
     let duration = Duration::from_secs(stage_seconds.max(1));
-
-    let outcome = match api {
-        ResolvedSpeedtestApi::Legacy => {
-            collect_latency_legacy_for_duration(client, server, duration).await
-        }
-        ResolvedSpeedtestApi::Modern => {
-            let mut samples = collect_latency_modern_ws_for_duration(server, duration).await;
-
-            if samples.is_empty() {
-                let guid = server.session_guid.as_deref().unwrap_or("tunmux-speedtest");
-                let fallback_samples = (duration.as_millis() / 100).max(10) as usize;
-                if let Ok(mut fallback) = browser_protocol::probe_latency_samples_http(
-                    client,
-                    server,
-                    guid,
-                    fallback_samples,
-                )
+    let mut samples = collect_latency_modern_ws_for_duration(server, duration).await;
+    if samples.is_empty() {
+        let guid = server.session_guid.as_deref().unwrap_or("tunmux-speedtest");
+        let fallback_samples = (duration.as_millis() / 100).max(10) as usize;
+        if let Ok(mut fallback) =
+            browser_protocol::probe_latency_samples_http(client, server, guid, fallback_samples)
                 .await
-                {
-                    samples.append(&mut fallback);
-                }
-            }
-
-            Ok(samples)
-        }
-        ResolvedSpeedtestApi::ModernTcp => {
-            collect_latency_modern_tcp_for_duration(server, duration).await
-        }
-    };
-
-    match outcome {
-        Ok(samples) => {
-            let raw_samples = samples.len();
-            let normalized = normalize_loaded_latency_samples(samples, stage_seconds);
-            debug!(
-                server_id = server.id,
-                host = %server.host,
-                stage_seconds,
-                raw_samples,
-                normalized_samples = normalized.len(),
-                "loaded latency samples normalized"
-            );
-            normalized
-        }
-        Err(error) => {
-            debug!(
-                server_id = server.id,
-                host = %server.host,
-                stage_seconds,
-                error = %error,
-                "loaded latency sampling failed"
-            );
-            Vec::new()
+        {
+            samples.append(&mut fallback);
         }
     }
+    let raw_samples = samples.len();
+    let normalized = normalize_loaded_latency_samples(samples, stage_seconds);
+    debug!(
+        server_id = server.id,
+        host = %server.host,
+        stage_seconds,
+        raw_samples,
+        normalized_samples = normalized.len(),
+        "loaded latency samples normalized"
+    );
+    normalized
 }
 
+#[allow(dead_code)]
 async fn collect_latency_modern_ws_for_duration(
     server: &SpeedtestServer,
     duration: Duration,
@@ -213,6 +181,7 @@ async fn collect_latency_modern_ws_for_duration(
     samples
 }
 
+#[allow(dead_code)]
 fn normalize_loaded_latency_samples(mut samples: Vec<f64>, stage_seconds: u64) -> Vec<f64> {
     samples.retain(|sample| sample.is_finite() && *sample >= 0.0 && *sample <= 10_000.0);
     if samples.is_empty() {
@@ -250,100 +219,16 @@ fn normalize_loaded_latency_samples(mut samples: Vec<f64>, stage_seconds: u64) -
     downsampled
 }
 
-async fn collect_latency_legacy_for_duration(
-    client: &Client,
-    server: &SpeedtestServer,
-    duration: Duration,
-) -> Result<Vec<f64>> {
-    let endpoint = server.latency_url()?;
-    let deadline = Instant::now() + duration;
-    let mut samples = Vec::new();
-
-    while Instant::now() < deadline {
-        let start = Instant::now();
-        if let Ok(response) = client.get(&endpoint).send().await
-            && let Ok(response) = response.error_for_status()
-            && response.bytes().await.is_ok()
-        {
-            samples.push(start.elapsed().as_secs_f64() * 1_000.0);
-        }
-    }
-
-    Ok(samples)
-}
-
-async fn collect_latency_modern_tcp_for_duration(
-    server: &SpeedtestServer,
-    duration: Duration,
-) -> Result<Vec<f64>> {
-    let deadline = Instant::now() + duration;
-    let mut stream = modern_protocol::connect(server).await?;
-    let mut samples = Vec::new();
-
-    while Instant::now() < deadline {
-        if let Ok(elapsed_ms) = modern_protocol::ping(&mut stream).await {
-            samples.push(elapsed_ms);
-        }
-    }
-
-    let _ = modern_protocol::quit(&mut stream).await;
-    Ok(samples)
-}
-
 async fn probe_server_latency_detailed(
     client: &Client,
     server: &SpeedtestServer,
     samples: usize,
-    api: ResolvedSpeedtestApi,
 ) -> Result<LatencyMeasurement> {
     if samples == 0 {
         bail!("latency_samples must be greater than zero");
     }
 
-    match api {
-        ResolvedSpeedtestApi::Legacy => probe_server_latency_legacy(client, server, samples).await,
-        ResolvedSpeedtestApi::Modern => {
-            probe_server_latency_modern_sdk(client, server, samples).await
-        }
-        ResolvedSpeedtestApi::ModernTcp => probe_server_latency_modern_tcp(server, samples).await,
-    }
-}
-
-async fn probe_server_latency_legacy(
-    client: &Client,
-    server: &SpeedtestServer,
-    samples: usize,
-) -> Result<LatencyMeasurement> {
-    let endpoint = server.latency_url()?;
-    let mut successful_samples = Vec::with_capacity(samples);
-
-    for _ in 0..samples {
-        let start = Instant::now();
-        let response = client.get(&endpoint).send().await;
-        if let Ok(response) = response
-            && let Ok(response) = response.error_for_status()
-            && response.bytes().await.is_ok()
-        {
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
-            successful_samples.push(elapsed_ms);
-        }
-    }
-
-    if successful_samples.len() * 2 < samples {
-        bail!(
-            "insufficient latency samples for server id={} ({} of {})",
-            server.id,
-            successful_samples.len(),
-            samples
-        );
-    }
-
-    let (average_ms, variance_ms) = compute_latency_stats(&successful_samples)?;
-    Ok(LatencyMeasurement {
-        average_ms,
-        variance_ms,
-        samples_ms: successful_samples,
-    })
+    probe_server_latency_modern_sdk(client, server, samples).await
 }
 
 async fn probe_server_latency_modern_sdk(
@@ -394,38 +279,6 @@ async fn probe_server_latency_modern_sdk(
         successful_samples = successful_samples.len(),
         "modern latency probing completed"
     );
-
-    if successful_samples.len() * 2 < samples {
-        bail!(
-            "insufficient latency samples for server id={} ({} of {})",
-            server.id,
-            successful_samples.len(),
-            samples
-        );
-    }
-
-    let (average_ms, variance_ms) = compute_latency_stats(&successful_samples)?;
-    Ok(LatencyMeasurement {
-        average_ms,
-        variance_ms,
-        samples_ms: successful_samples,
-    })
-}
-
-async fn probe_server_latency_modern_tcp(
-    server: &SpeedtestServer,
-    samples: usize,
-) -> Result<LatencyMeasurement> {
-    let mut stream = modern_protocol::connect(server).await?;
-    let mut successful_samples = Vec::with_capacity(samples);
-
-    for _ in 0..samples {
-        if let Ok(elapsed_ms) = modern_protocol::ping(&mut stream).await {
-            successful_samples.push(elapsed_ms);
-        }
-    }
-
-    let _ = modern_protocol::quit(&mut stream).await;
 
     if successful_samples.len() * 2 < samples {
         bail!(

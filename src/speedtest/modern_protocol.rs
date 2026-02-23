@@ -27,6 +27,7 @@ pub async fn connect(server: &SpeedtestServer) -> Result<TcpStream> {
     Ok(stream)
 }
 
+#[allow(dead_code)]
 pub async fn ping(stream: &mut TcpStream) -> Result<f64> {
     let token = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,6 +108,7 @@ fn looks_like_host_with_port(host: &str) -> bool {
         .is_some()
 }
 
+#[allow(dead_code)]
 fn validate_pong_line(line: &str) -> Result<()> {
     let mut fields = line.split_whitespace();
     let command = fields

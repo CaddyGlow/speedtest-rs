@@ -12,7 +12,7 @@ use crate::model::{
     BenchmarkResult, ClientMeta, DirectionDetails, RunDetails, RunResult,
     SelectedServerLatencyDetails, Server, ThroughputInterval,
 };
-use crate::speedtest::api::ResolvedSpeedtestApi;
+use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::config::SpeedtestConfig;
 use crate::speedtest::download::{self, DownloadProgress};
 use crate::speedtest::sdk_payload;
@@ -62,50 +62,6 @@ pub enum EngineEvent {
         guid: String,
         hash: String,
     },
-}
-
-pub fn consume_event(event: &EngineEvent) {
-    match event {
-        EngineEvent::StageStarting(stage) | EngineEvent::StageFinished(stage) => {
-            let _ = *stage;
-        }
-        EngineEvent::CandidateProbed {
-            index,
-            total,
-            server_id,
-            average_ms,
-            variance_ms,
-            error,
-        } => {
-            let _ = (
-                *index,
-                *total,
-                *server_id,
-                *average_ms,
-                *variance_ms,
-                error.as_deref(),
-            );
-        }
-        EngineEvent::ServerSelected {
-            server_id,
-            average_ms,
-            variance_ms,
-        } => {
-            let _ = (*server_id, *average_ms, *variance_ms);
-        }
-        EngineEvent::StageProgress {
-            stage,
-            elapsed,
-            mbps,
-            bytes,
-            active_connections,
-        } => {
-            let _ = (*stage, *elapsed, *mbps, *bytes, *active_connections);
-        }
-        EngineEvent::SavePayloadBuilt { guid, hash } => {
-            let _ = (guid.as_str(), hash.as_str());
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +180,7 @@ pub async fn run_speedtest_engine<F>(
     client: &Client,
     config: &SpeedtestConfig,
     servers: &[SpeedtestServer],
-    api: ResolvedSpeedtestApi,
+    mode: TransportProtocol,
     settings: &EngineSettings,
     mut on_event: F,
 ) -> Result<EngineOutcome>
@@ -237,7 +193,7 @@ where
     }
 
     on_event(EngineEvent::StageStarting(EngineStage::ServerSelection));
-    let selection = select_server(client, servers, api, settings, &mut on_event).await?;
+    let selection = select_server(client, servers, settings, &mut on_event).await?;
     on_event(EngineEvent::ServerSelected {
         server_id: selection.selected.server.id,
         average_ms: selection.selected.average_ms,
@@ -259,7 +215,7 @@ where
 
     let mut result = RunResult {
         timestamp: current_timestamp()?,
-        speedtest_api: Some(api.to_string()),
+        speedtest_api: Some(mode.to_string()),
         client: Some(ClientMeta {
             ip: config.client.ip.clone(),
             isp: config.client.isp.clone(),
@@ -325,7 +281,7 @@ where
                 let stats = download::run_download_test(
                     client,
                     &selection.selected.server,
-                    api,
+                    mode,
                     &selection.transfer_pool,
                     clamp_worker_count(settings.download_connections),
                     settings.download_seconds,
@@ -400,7 +356,7 @@ where
                 let stats = upload::run_upload_test(
                     client,
                     &selection.selected.server,
-                    api,
+                    mode,
                     &selection.transfer_pool,
                     clamp_worker_count(settings.upload_connections),
                     settings.upload_seconds,
@@ -527,7 +483,6 @@ struct SelectionOutcome {
 async fn select_server<F>(
     client: &Client,
     servers: &[SpeedtestServer],
-    api: ResolvedSpeedtestApi,
     settings: &EngineSettings,
     on_event: &mut F,
 ) -> Result<SelectionOutcome>
@@ -541,7 +496,7 @@ where
             .cloned()
             .with_context(|| format!("server id {server_id} not found in provided server list"))?;
         let measurement =
-            select::probe_server_latency(client, &server, settings.latency_samples, api).await?;
+            select::probe_server_latency(client, &server, settings.latency_samples).await?;
         on_event(EngineEvent::CandidateProbed {
             index: 1,
             total: 1,
@@ -568,7 +523,6 @@ where
     let ranked = select::probe_and_rank_candidates_with_progress(
         client,
         servers,
-        api,
         settings.candidate_servers,
         settings.latency_samples,
         |index, total, server, outcome, error| {
@@ -598,7 +552,7 @@ where
     let selected = select::select_best_latency(&ranked)
         .context("no ranked speedtest candidates were produced")?;
 
-    let transfer_pool = build_transfer_pool(&ranked, api, settings.modern_pool_size.max(1));
+    let transfer_pool = build_transfer_pool(&ranked, settings.modern_pool_size.max(1));
     let latency_by_server = ranked
         .iter()
         .map(|entry| {
@@ -616,16 +570,8 @@ where
     })
 }
 
-fn build_transfer_pool(
-    ranked: &[ServerLatency],
-    api: ResolvedSpeedtestApi,
-    pool_size: usize,
-) -> Vec<SpeedtestServer> {
-    let limit = if matches!(api, ResolvedSpeedtestApi::Legacy) {
-        1
-    } else {
-        pool_size.max(1)
-    };
+fn build_transfer_pool(ranked: &[ServerLatency], pool_size: usize) -> Vec<SpeedtestServer> {
+    let limit = pool_size.max(1);
 
     if ranked.is_empty() {
         return Vec::new();
@@ -826,7 +772,6 @@ mod tests {
         calculate_iqm, calculate_jitter, calculate_result_hash, calculate_rtt,
         sort_latency_rankings,
     };
-    use crate::speedtest::api::ResolvedSpeedtestApi;
     use crate::speedtest::select::ServerLatency;
     use crate::speedtest::servers::SpeedtestServer;
 
@@ -937,7 +882,7 @@ mod tests {
             },
         ];
 
-        let pool = build_transfer_pool(&ranked, ResolvedSpeedtestApi::Modern, 4);
+        let pool = build_transfer_pool(&ranked, 4);
         let ids = pool.iter().map(|server| server.id).collect::<Vec<_>>();
 
         assert_eq!(ids, vec![1, 2]);

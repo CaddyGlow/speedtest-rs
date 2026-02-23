@@ -371,7 +371,7 @@ fn local_upload_bps(result: &RunResult) -> Option<u64> {
 
 fn infer_protocols(speedtest_api: Option<&str>) -> SdkProtocols {
     match speedtest_api {
-        Some("modern-tcp") => SdkProtocols {
+        Some("tcp") => SdkProtocols {
             test_method: "wss,tcps,tcps",
             latency_protocol: "ws",
             download_protocol: "tcp",

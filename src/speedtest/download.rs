@@ -7,7 +7,7 @@ use reqwest::Client;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::speedtest::api::ResolvedSpeedtestApi;
+use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
@@ -44,7 +44,7 @@ pub struct DownloadProgress {
 pub async fn run_download_test<F>(
     client: &Client,
     selected_server: &SpeedtestServer,
-    api: ResolvedSpeedtestApi,
+    mode: TransportProtocol,
     server_pool: &[SpeedtestServer],
     connections: usize,
     seconds: u64,
@@ -82,25 +82,8 @@ where
     );
 
     let workers = async {
-        match api {
-            ResolvedSpeedtestApi::Legacy => {
-                run_download_workers_legacy(
-                    client,
-                    selected_server,
-                    worker_count,
-                    stop_at,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_http_errors,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                    &per_server_bytes,
-                )
-                .await;
-            }
-            ResolvedSpeedtestApi::Modern => {
+        match mode {
+            TransportProtocol::Xhr => {
                 run_download_workers_modern_sdk(
                     client,
                     &transfer_pool,
@@ -118,7 +101,7 @@ where
                 )
                 .await;
             }
-            ResolvedSpeedtestApi::ModernTcp => {
+            TransportProtocol::Tcp => {
                 run_download_workers_modern(
                     &transfer_pool,
                     worker_count,
@@ -193,80 +176,6 @@ fn normalize_server_pool(
     } else {
         server_pool.to_vec()
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_download_workers_legacy(
-    client: &Client,
-    server: &SpeedtestServer,
-    worker_count: usize,
-    stop_at: Instant,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_http_errors: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    per_server_bytes: &Arc<Vec<AtomicU64>>,
-) {
-    let mut tasks = JoinSet::new();
-    for worker in 0..worker_count {
-        let worker_client = client.clone();
-        let worker_server = server.clone();
-        let worker_bytes = Arc::clone(total_bytes);
-        let worker_attempts = Arc::clone(request_attempts);
-        let worker_successes = Arc::clone(request_successes);
-        let worker_http_errors = Arc::clone(request_http_errors);
-        let worker_transport_errors = Arc::clone(request_transport_errors);
-        let worker_read_errors = Arc::clone(response_read_errors);
-        let worker_active_connections = Arc::clone(active_connections);
-        let worker_per_server_bytes = Arc::clone(per_server_bytes);
-        tasks.spawn(async move {
-            const SIZES: [usize; 8] = [500, 750, 1000, 1500, 2000, 2500, 3000, 4000];
-            let mut cursor = worker % SIZES.len();
-
-            while Instant::now() < stop_at {
-                let size = SIZES[cursor];
-                cursor = (cursor + 1) % SIZES.len();
-
-                let Ok(url) = worker_server.download_url(size) else {
-                    break;
-                };
-
-                worker_attempts.fetch_add(1, Ordering::Relaxed);
-
-                let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
-
-                let response = match worker_client.get(url).send().await {
-                    Ok(response) => match response.error_for_status() {
-                        Ok(response) => response,
-                        Err(_) => {
-                            worker_http_errors.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    },
-                    Err(_) => {
-                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-
-                match response.bytes().await {
-                    Ok(body) => {
-                        worker_successes.fetch_add(1, Ordering::Relaxed);
-                        worker_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                        worker_per_server_bytes[0].fetch_add(body.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        });
-    }
-
-    while tasks.join_next().await.is_some() {}
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -104,6 +104,7 @@ pub async fn probe_latency_samples_websocket(
     Err(error).with_context(|| format!("websocket latency probe failed at {endpoint}"))
 }
 
+#[allow(dead_code)]
 pub async fn probe_latency_samples_websocket_for_duration(
     server: &SpeedtestServer,
     duration: Duration,
@@ -299,6 +300,7 @@ async fn probe_latency_samples_over_websocket_endpoint(
     Ok(successful_samples)
 }
 
+#[allow(dead_code)]
 async fn probe_latency_samples_over_websocket_endpoint_for_duration(
     endpoint: &Url,
     duration: Duration,
