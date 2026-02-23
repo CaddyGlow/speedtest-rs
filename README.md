@@ -36,6 +36,13 @@ cargo build
 
 ## Usage
 
+Proxy precedence for both `run` and `iperf`:
+
+- explicit `--proxy`
+- `HTTPS_PROXY` / `https_proxy`
+- `HTTP_PROXY` / `http_proxy`
+- `ALL_PROXY` / `all_proxy`
+
 Run with defaults:
 
 ```bash

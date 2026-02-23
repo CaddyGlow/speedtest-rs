@@ -21,7 +21,7 @@ use crate::output;
 use crate::speedtest;
 use crate::speedtest::engine::{self, EngineSettings as StageEngineSettings};
 use crate::ui;
-use crate::util::clamp_worker_count;
+use crate::util::{clamp_worker_count, resolve_proxy_url};
 
 #[derive(Debug, Clone, Copy)]
 struct LiveLatencySnapshot {
@@ -155,11 +155,12 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
 
     ui.render_phase("building HTTP client");
 
-    let client = http::build_client(effective_args.proxy.as_deref())?;
-
-    if let Some(proxy) = effective_args.proxy.as_deref() {
+    let proxy = resolve_proxy_url(effective_args.proxy.as_deref());
+    if let Some(proxy) = proxy.as_deref() {
         ui.render_metric("proxy", proxy);
     }
+
+    let client = http::build_client(proxy.as_deref())?;
 
     ui.render_metric("mode", &effective_args.mode.to_string());
     ui.render_metric("pool_size", &effective_args.pool_size.to_string());
@@ -576,8 +577,8 @@ fn rolling_stddev_ms(samples: &VecDeque<f64>) -> Option<f64> {
 }
 
 async fn run_iperf(args: IperfArgs) -> Result<()> {
-    let proxy_spec = args
-        .proxy
+    let proxy_url = resolve_proxy_url(args.proxy.as_deref());
+    let proxy_spec = proxy_url
         .as_deref()
         .map(iperf::proxy::parse_proxy)
         .transpose()?;

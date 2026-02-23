@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::env;
 use url::Url;
 
 use crate::error::AppError;
@@ -14,6 +15,30 @@ pub fn validate_proxy_scheme(proxy: &str) -> Result<()> {
         ))
         .into()),
     }
+}
+
+pub fn resolve_proxy_url(cli_proxy: Option<&str>) -> Option<String> {
+    if let Some(cli_proxy) = cli_proxy {
+        return Some(cli_proxy.to_string());
+    }
+
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 #[must_use]
@@ -32,9 +57,37 @@ pub fn mbps_from_bytes(bytes: u64, seconds: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
     use super::{
-        MAX_BENCHMARK_WORKERS, clamp_worker_count, mbps_from_bytes, validate_proxy_scheme,
+        MAX_BENCHMARK_WORKERS, clamp_worker_count, mbps_from_bytes, resolve_proxy_url,
+        validate_proxy_scheme,
     };
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_env_lock(body: impl FnOnce()) {
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap();
+        body();
+    }
+
+    fn with_temp_env(name: &str, value: Option<&str>, body: impl FnOnce()) {
+        let previous = env::var_os(name);
+
+        match value {
+            Some(value) => unsafe { env::set_var(name, value) },
+            None => unsafe { env::remove_var(name) },
+        }
+
+        body();
+
+        match previous {
+            Some(previous) => unsafe { env::set_var(name, previous) },
+            None => unsafe { env::remove_var(name) },
+        }
+    }
 
     #[test]
     fn allows_expected_proxy_schemes() {
@@ -64,5 +117,33 @@ mod tests {
     fn converts_bytes_per_second_to_mbps() {
         let mbps = mbps_from_bytes(125_000_000, 10);
         assert!((mbps - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn resolves_proxy_from_cli_before_env() {
+        with_env_lock(|| {
+            with_temp_env("HTTPS_PROXY", Some("http://env.example:3128"), || {
+                assert_eq!(
+                    resolve_proxy_url(Some("http://cli.example:8080")),
+                    Some("http://cli.example:8080".to_string())
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn resolves_proxy_from_env_precedence() {
+        with_env_lock(|| {
+            with_temp_env("ALL_PROXY", Some("http://all.example:1080"), || {
+                with_temp_env("HTTPS_PROXY", Some("https://https.example:444"), || {
+                    with_temp_env("http_proxy", Some("http://http.example:8080"), || {
+                        assert_eq!(
+                            resolve_proxy_url(None),
+                            Some("https://https.example:444".to_string())
+                        );
+                    });
+                });
+            });
+        });
     }
 }

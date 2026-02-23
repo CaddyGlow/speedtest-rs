@@ -89,7 +89,7 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "download_only")]
     pub upload_only: bool,
 
-    /// Optional HTTP/HTTPS/SOCKS5 proxy URL
+    /// Optional HTTP/HTTPS/SOCKS5 proxy URL (falls back to http_proxy/https_proxy/all_proxy env vars)
     #[arg(long)]
     pub proxy: Option<String>,
 
@@ -157,7 +157,7 @@ pub struct IperfArgs {
     #[arg(long, value_parser = parse_positive_u64)]
     pub bitrate: Option<u64>,
 
-    /// Optional HTTP/SOCKS5 proxy URL
+    /// Optional HTTP/SOCKS5 proxy URL (falls back to http_proxy/https_proxy/all_proxy env vars)
     #[arg(long)]
     pub proxy: Option<String>,
 
