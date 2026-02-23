@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{SecondsFormat, Utc};
 #[cfg(test)]
 use md5::compute as md5_compute;
 use reqwest::Client;
@@ -674,8 +675,7 @@ fn push_interval(
 }
 
 fn current_timestamp() -> Result<String> {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(timestamp.to_string())
+    Ok(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 pub fn calculate_rtt(samples: &[f64]) -> Option<RttSummary> {

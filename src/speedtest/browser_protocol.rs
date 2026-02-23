@@ -18,8 +18,8 @@ use url::Url;
 use crate::speedtest::servers::SpeedtestServer;
 
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const WS_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const WS_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_PROTOCOL_LEVEL: &str = "2";
 
 #[derive(Debug, Clone, Copy)]

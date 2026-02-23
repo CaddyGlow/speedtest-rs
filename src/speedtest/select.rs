@@ -1,16 +1,19 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::speedtest::browser_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 
+const LATENCY_PROBE_WORKERS: usize = 8;
 #[allow(dead_code)]
-const LOADED_LATENCY_WORKERS: usize = 2;
+const LOADED_LATENCY_WORKERS: usize = 8;
 #[allow(dead_code)]
 const LOADED_LATENCY_MAX_SAMPLES_PER_SEC: usize = 25;
 #[allow(dead_code)]
@@ -63,10 +66,32 @@ where
         bail!("no speedtest servers available for latency probing");
     }
 
-    let mut scored = Vec::new();
     let total_candidates = candidates.len();
+    let semaphore = Arc::new(Semaphore::new(
+        LATENCY_PROBE_WORKERS.min(total_candidates).max(1),
+    ));
+    let mut tasks = JoinSet::new();
+
     for (index, server) in candidates.into_iter().enumerate() {
-        match probe_server_latency_detailed(client, &server, latency_samples).await {
+        let probe_client = client.clone();
+        let probe_server = server.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move {
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .context("latency probe worker semaphore closed")?;
+            let result =
+                probe_server_latency_detailed(&probe_client, &probe_server, latency_samples).await;
+            drop(permit);
+            Ok::<_, anyhow::Error>((index, probe_server, result))
+        });
+    }
+
+    let mut scored = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        let (index, server, outcome) = joined.context("latency probe worker task failed")??;
+        match outcome {
             Ok(measurement) => {
                 on_probe(
                     index + 1,
