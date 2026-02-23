@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
@@ -285,11 +286,11 @@ async fn probe_latency_samples_over_websocket_endpoint(
         }
 
         successful_samples.push(start.elapsed().as_secs_f64() * 1_000.0);
-        debug!(
+        trace!(
             endpoint = %endpoint,
             sample_index,
             latency_ms = successful_samples.last().copied().unwrap_or_default(),
-            "websocket latency sample recorded"
+            "ws latency sample"
         );
     }
 
@@ -372,61 +373,212 @@ async fn stream_upload_stats_over_endpoint(
     sample_interval_ms: u64,
     sender: &UnboundedSender<UploadStatsSample>,
 ) -> Result<()> {
-    let mut request = endpoint
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("failed building websocket request for {endpoint}"))?;
-
-    let headers = request.headers_mut();
-    headers.insert("Origin", "https://www.speedtest.net".parse()?);
-    headers.insert("User-Agent", "Mozilla/5.0".parse()?);
-    headers.insert("Accept", "*/*".parse()?);
-    headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
-    headers.insert("Cache-Control", "no-cache".parse()?);
-    headers.insert("Pragma", "no-cache".parse()?);
-
-    let (mut socket, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .with_context(|| format!("timed out connecting websocket {endpoint}"))?
-        .with_context(|| format!("failed to open websocket {endpoint}"))?;
-
     let upload_stats_duration_ms = duration_seconds.saturating_mul(1_000);
-    ws_send_text(&mut socket, &format!("HI {guid}"), "HI upload stats").await?;
-    ws_send_text(
-        &mut socket,
-        &format!("UPLOAD_STATS {upload_stats_duration_ms} {sample_interval_ms} 0"),
-        "UPLOAD_STATS",
-    )
-    .await?;
-
+    let frame_timeout =
+        Duration::from_millis((sample_interval_ms.saturating_mul(3)).clamp(700, 2_000));
+    let reconnect_delay = Duration::from_millis((sample_interval_ms / 2).clamp(40, 220));
+    let mut unparsed_upload_stats_frames = 0_usize;
+    let mut control_frames_logged = 0_usize;
+    let mut next_index = 0_u64;
     let deadline = Instant::now() + Duration::from_millis(upload_stats_duration_ms + 2_000);
+
+    let mut connected_once = false;
+    let mut last_error = None;
+
     while Instant::now() < deadline {
-        let Some(text) = ws_next_text(&mut socket, "UPLOAD_STATS frame").await? else {
-            continue;
+        let mut request = endpoint
+            .as_str()
+            .into_client_request()
+            .with_context(|| format!("failed building websocket request for {endpoint}"))?;
+
+        let headers = request.headers_mut();
+        headers.insert("Origin", "https://www.speedtest.net".parse()?);
+        headers.insert("User-Agent", "Mozilla/5.0".parse()?);
+        headers.insert("Accept", "*/*".parse()?);
+        headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
+        headers.insert("Cache-Control", "no-cache".parse()?);
+        headers.insert("Pragma", "no-cache".parse()?);
+
+        let (mut socket, _) = match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+            Ok(Ok(connected)) => {
+                connected_once = true;
+                connected
+            }
+            Ok(Err(error)) => {
+                let error = anyhow!("failed to open websocket {endpoint}: {error}");
+                last_error = Some(error);
+                tokio::time::sleep(reconnect_delay).await;
+                continue;
+            }
+            Err(_) => {
+                let error = anyhow!("timed out connecting websocket {endpoint}");
+                last_error = Some(error);
+                tokio::time::sleep(reconnect_delay).await;
+                continue;
+            }
         };
 
-        if text.starts_with("HELLO") || text.starts_with("CAPABILITIES") {
+        if let Err(error) =
+            ws_send_text(&mut socket, &format!("HI {guid}"), "HI upload stats").await
+        {
+            last_error = Some(error);
+            let _ = socket.close(None).await;
+            tokio::time::sleep(reconnect_delay).await;
             continue;
         }
 
-        if text.starts_with("ERROR") {
-            bail!("server returned websocket upload stats error");
+        if let Err(error) = send_upload_stats_request(
+            &mut socket,
+            upload_stats_duration_ms,
+            sample_interval_ms,
+            next_index,
+        )
+        .await
+        {
+            last_error = Some(error);
+            let _ = socket.close(None).await;
+            tokio::time::sleep(reconnect_delay).await;
+            continue;
         }
 
-        if let Some(sample) = parse_upload_stats_sample(&text) {
-            debug!(
-                endpoint = %endpoint,
-                bytes = sample.bytes,
-                elapsed_ms = sample.elapsed_ms,
-                sample_index = sample.index.unwrap_or(0),
-                "streamed upload stats sample"
-            );
-            let _ = sender.send(sample);
+        let mut consecutive_timeouts = 0_u8;
+        while Instant::now() < deadline {
+            let frame =
+                match ws_next_text_with_timeout(&mut socket, "UPLOAD_STATS frame", frame_timeout)
+                    .await
+                {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                };
+            let text = match frame {
+                WsNextFrame::Text(text) => {
+                    consecutive_timeouts = 0;
+                    text
+                }
+                WsNextFrame::NonText => continue,
+                WsNextFrame::Timeout => {
+                    consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                    let _ = send_upload_stats_request(
+                        &mut socket,
+                        upload_stats_duration_ms,
+                        sample_interval_ms,
+                        next_index,
+                    )
+                    .await;
+                    if consecutive_timeouts >= 2 {
+                        break;
+                    }
+                    continue;
+                }
+                WsNextFrame::Closed => break,
+            };
+
+            for frame in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                if is_upload_stats_control_frame(frame) {
+                    if control_frames_logged < 6 {
+                        control_frames_logged += 1;
+                        debug!(
+                            endpoint = %endpoint,
+                            next_index,
+                            "ws upload stats control frame"
+                        );
+                    }
+                    let _ = send_upload_stats_request(
+                        &mut socket,
+                        upload_stats_duration_ms,
+                        sample_interval_ms,
+                        next_index,
+                    )
+                    .await;
+                    continue;
+                }
+
+                if frame.starts_with("HELLO") || frame.starts_with("CAPABILITIES") {
+                    continue;
+                }
+
+                if frame.starts_with("ERROR") {
+                    let _ = socket.close(None).await;
+                    bail!("server returned websocket upload stats error");
+                }
+
+                if let Some(sample) = parse_upload_stats_sample(frame) {
+                    debug!(
+                        endpoint = %endpoint,
+                        bytes = sample.bytes,
+                        elapsed_ms = sample.elapsed_ms,
+                        sample_index = sample.index.unwrap_or(0),
+                        "ws upload stats parsed sample"
+                    );
+                    trace!(
+                        endpoint = %endpoint,
+                        bytes = sample.bytes,
+                        elapsed_ms = sample.elapsed_ms,
+                        sample_index = sample.index.unwrap_or(0),
+                        "ws upload stats sample"
+                    );
+                    let _ = sender.send(sample);
+
+                    if let Some(index) = sample.index {
+                        let candidate = index.saturating_add(1);
+                        if candidate > next_index {
+                            next_index = candidate;
+                        }
+                    }
+
+                    if sample.elapsed_ms < upload_stats_duration_ms {
+                        let _ = send_upload_stats_request(
+                            &mut socket,
+                            upload_stats_duration_ms,
+                            sample_interval_ms,
+                            next_index,
+                        )
+                        .await;
+                    }
+                } else if frame.starts_with('{') && unparsed_upload_stats_frames < 6 {
+                    unparsed_upload_stats_frames += 1;
+                    debug!(
+                        endpoint = %endpoint,
+                        frame = %truncate_for_log(frame, 220),
+                        "unparsed upload stats frame"
+                    );
+                }
+            }
+        }
+
+        let _ = socket.close(None).await;
+        if Instant::now() < deadline {
+            tokio::time::sleep(reconnect_delay).await;
         }
     }
 
-    let _ = socket.close(None).await;
-    Ok(())
+    if connected_once {
+        Ok(())
+    } else if let Some(error) = last_error {
+        Err(error)
+            .with_context(|| format!("failed collecting websocket upload stats at {endpoint}"))
+    } else {
+        bail!("failed collecting websocket upload stats at {endpoint}")
+    }
+}
+
+async fn send_upload_stats_request(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    duration_ms: u64,
+    sample_interval_ms: u64,
+    next_index: u64,
+) -> Result<()> {
+    ws_send_text(
+        socket,
+        &format!("UPLOAD_STATS {duration_ms} {sample_interval_ms} {next_index}"),
+        "UPLOAD_STATS",
+    )
+    .await
 }
 
 async fn ping_over_http_once(client: &Client, server: &SpeedtestServer, guid: &str) -> Result<f64> {
@@ -521,48 +673,173 @@ async fn ws_expect_prefix(
     }
 }
 
-async fn ws_next_text(
+enum WsNextFrame {
+    Text(String),
+    NonText,
+    Timeout,
+    Closed,
+}
+
+async fn ws_next_text_with_timeout(
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     action: &str,
-) -> Result<Option<String>> {
-    let frame = timeout(WS_IO_TIMEOUT, socket.next())
-        .await
-        .with_context(|| format!("timed out waiting for websocket {action}"))?;
+    io_timeout: Duration,
+) -> Result<WsNextFrame> {
+    let frame = match timeout(io_timeout, socket.next()).await {
+        Ok(frame) => frame,
+        Err(_) => return Ok(WsNextFrame::Timeout),
+    };
 
     let Some(frame) = frame else {
-        return Ok(None);
+        return Ok(WsNextFrame::Closed);
     };
 
     match frame.context("websocket frame error")? {
-        Message::Text(text) => Ok(Some(text.trim().to_string())),
-        Message::Binary(_) | Message::Pong(_) => Ok(None),
+        Message::Text(text) => Ok(WsNextFrame::Text(text.trim().to_string())),
+        Message::Binary(payload) => {
+            if let Ok(text) = String::from_utf8(payload.to_vec()) {
+                Ok(WsNextFrame::Text(text.trim().to_string()))
+            } else {
+                Ok(WsNextFrame::NonText)
+            }
+        }
+        Message::Pong(_) => Ok(WsNextFrame::NonText),
         Message::Ping(payload) => {
             timeout(WS_IO_TIMEOUT, socket.send(Message::Pong(payload)))
                 .await
                 .with_context(|| format!("timed out replying websocket PONG for {action}"))?
                 .with_context(|| format!("failed replying websocket PONG for {action}"))?;
-            Ok(None)
+            Ok(WsNextFrame::NonText)
         }
-        Message::Close(_) => Ok(None),
-        Message::Frame(_) => Ok(None),
+        Message::Close(_) => Ok(WsNextFrame::Closed),
+        Message::Frame(_) => Ok(WsNextFrame::NonText),
     }
 }
 
 fn parse_upload_stats_sample(text: &str) -> Option<UploadStatsSample> {
-    let parsed = serde_json::from_str::<RawUploadStatsSample>(text).ok()?;
-    if let Some(sample_type) = parsed.sample_type.as_deref()
+    let parsed = serde_json::from_str::<RawUploadStatsSample>(text).ok();
+    if let Some(parsed) = parsed {
+        if let Some(sample_type) = parsed.sample_type.as_deref()
+            && sample_type != "u"
+        {
+            return None;
+        }
+
+        return Some(UploadStatsSample {
+            bytes: parsed.bytes,
+            elapsed_ms: parsed.elapsed_ms,
+            index: parsed.index,
+        });
+    }
+
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let object = value.as_object()?;
+
+    if let Some(sample_type) = object.get("t").and_then(Value::as_str)
         && sample_type != "u"
     {
         return None;
     }
 
+    let bytes = parse_u64_any(&value, &["b", "bytes", "totalBytes", "total_bytes"])?;
+    let elapsed_ms = parse_u64_any(
+        &value,
+        &["e", "elapsed", "elapsedMs", "elapsedMillis", "elapsed_ms"],
+    )?;
+    let index = parse_u64_any(&value, &["i", "index", "sample", "seq"]);
+
     Some(UploadStatsSample {
-        bytes: parsed.bytes,
-        elapsed_ms: parsed.elapsed_ms,
-        index: parsed.index,
+        bytes,
+        elapsed_ms,
+        index,
     })
+}
+
+fn parse_u64_any(value: &Value, keys: &[&str]) -> Option<u64> {
+    if let Some(object) = value.as_object() {
+        for key in keys {
+            if let Some(candidate) = object.get(*key)
+                && let Some(parsed) = parse_u64_scalar(candidate)
+            {
+                return Some(parsed);
+            }
+        }
+
+        for nested in object.values() {
+            if let Some(parsed) = parse_u64_any(nested, keys) {
+                return Some(parsed);
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        for nested in array {
+            if let Some(parsed) = parse_u64_any(nested, keys) {
+                return Some(parsed);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_u64_scalar(value: &Value) -> Option<u64> {
+    if let Some(as_u64) = value.as_u64() {
+        return Some(as_u64);
+    }
+
+    if let Some(as_i64) = value.as_i64()
+        && as_i64 >= 0
+    {
+        return Some(as_i64 as u64);
+    }
+
+    if let Some(as_f64) = value.as_f64()
+        && as_f64.is_finite()
+        && as_f64 >= 0.0
+    {
+        return Some(as_f64.round() as u64);
+    }
+
+    if let Some(as_str) = value.as_str()
+        && let Ok(parsed) = as_str.parse::<f64>()
+        && parsed.is_finite()
+        && parsed >= 0.0
+    {
+        return Some(parsed.round() as u64);
+    }
+
+    None
+}
+
+fn is_upload_stats_control_frame(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(sample_type) = object.get("t").and_then(Value::as_str) else {
+        return false;
+    };
+
+    sample_type == "u"
+        && parse_u64_any(&value, &["b", "bytes", "totalBytes", "total_bytes"]).is_none()
+        && parse_u64_any(
+            &value,
+            &["e", "elapsed", "elapsedMs", "elapsedMillis", "elapsed_ms"],
+        )
+        .is_none()
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let mut output = input.chars().take(max_chars).collect::<String>();
+    if input.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
 }
 
 pub async fn download(
@@ -582,7 +859,7 @@ pub async fn download(
             .append_pair("size", &size.to_string())
             .append_pair("guid", guid);
 
-        let response = match browser_headers(client.get(url.clone())).send().await {
+        let mut response = match browser_headers(client.get(url.clone())).send().await {
             Ok(response) => response,
             Err(error) => {
                 debug!(server_id = server.id, endpoint = %url, error = %error, "download endpoint transport failed");
@@ -597,12 +874,46 @@ pub async fn download(
             continue;
         }
 
-        match response.bytes().await {
-            Ok(body) => return Ok(body.len() as u64),
-            Err(error) => {
-                debug!(server_id = server.id, endpoint = %url, error = %error, "download response read failed");
-                last_error = Some(TransferRequestError::ResponseRead);
+        let content_length = response.content_length();
+        let mut read_bytes = 0_u64;
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    read_bytes = read_bytes.saturating_add(chunk.len() as u64);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    if read_bytes > 0 {
+                        debug!(
+                            server_id = server.id,
+                            endpoint = %url,
+                            partial_bytes = read_bytes,
+                            error = %error,
+                            "download response read failed after partial body, accepting partial bytes"
+                        );
+                        return Ok(read_bytes);
+                    }
+                    if let Some(length) = content_length.filter(|length| *length > 0) {
+                        debug!(
+                            server_id = server.id,
+                            endpoint = %url,
+                            content_length = length,
+                            error = %error,
+                            "download response read failed, using content-length fallback"
+                        );
+                        return Ok(length);
+                    }
+
+                    debug!(server_id = server.id, endpoint = %url, error = %error, "download response read failed");
+                    last_error = Some(TransferRequestError::ResponseRead);
+                    break;
+                }
             }
+        }
+
+        if read_bytes > 0 {
+            return Ok(read_bytes);
         }
     }
 
@@ -646,13 +957,7 @@ pub async fn upload(
             continue;
         }
 
-        match response.bytes().await {
-            Ok(_) => return Ok(body_len),
-            Err(error) => {
-                debug!(server_id = server.id, endpoint = %url, error = %error, "upload response read failed");
-                last_error = Some(TransferRequestError::ResponseRead);
-            }
-        }
+        return Ok(body_len);
     }
 
     Err(last_error.unwrap_or(TransferRequestError::InvalidEndpoint))
@@ -738,6 +1043,7 @@ fn browser_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder 
         .header("Referer", "https://www.speedtest.net/")
         .header("User-Agent", "Mozilla/5.0")
         .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")

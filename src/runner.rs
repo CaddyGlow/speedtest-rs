@@ -21,6 +21,7 @@ use crate::model::{
 use crate::output;
 use crate::speedtest;
 use crate::speedtest::api::{ModernTransportMode, ResolvedSpeedtestApi, SpeedtestApiMode};
+use crate::speedtest::engine::{self, EngineSettings as StageEngineSettings};
 use crate::speedtest::servers::SpeedtestServer;
 use crate::ui;
 use crate::util::clamp_worker_count;
@@ -144,6 +145,10 @@ fn run_cache_command(command: CacheCommand) -> Result<()> {
 }
 
 async fn run_speedtest(args: RunArgs) -> Result<()> {
+    if std::env::var_os("TUNMUX_SPEEDTEST_ENGINE").is_some() {
+        return run_speedtest_with_stage_engine(args).await;
+    }
+
     let mut effective_args = args.clone();
     effective_args.download_connections = clamp_worker_count(effective_args.download_connections);
     effective_args.upload_connections = clamp_worker_count(effective_args.upload_connections);
@@ -782,6 +787,96 @@ async fn run_speedtest(args: RunArgs) -> Result<()> {
         }
     } else {
         output::print_human(&result);
+    }
+
+    Ok(())
+}
+
+async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
+    let mut effective_args = args.clone();
+    effective_args.download_connections = clamp_worker_count(effective_args.download_connections);
+    effective_args.upload_connections = clamp_worker_count(effective_args.upload_connections);
+
+    let client = http::build_client(effective_args.proxy.as_deref())?;
+    let config = speedtest::config::fetch_config(&client).await?;
+
+    let requested_api_mode = match effective_args.speedtest_api {
+        SpeedtestApiMode::ModernTcp => SpeedtestApiMode::Modern,
+        mode => mode,
+    };
+    let fetch_limit = if effective_args.server_id.is_some() {
+        effective_args.candidate_servers.max(200)
+    } else {
+        effective_args.candidate_servers.max(25)
+    };
+    let client_location = (config.client.latitude, config.client.longitude);
+    let (servers, resolved_api) = speedtest::servers::fetch_servers(
+        &client,
+        requested_api_mode,
+        fetch_limit,
+        Some(client_location),
+    )
+    .await?;
+
+    let transfer_api = match resolved_api {
+        ResolvedSpeedtestApi::Modern
+            if matches!(effective_args.modern_mode, ModernTransportMode::Tcp)
+                || matches!(effective_args.speedtest_api, SpeedtestApiMode::ModernTcp) =>
+        {
+            ResolvedSpeedtestApi::ModernTcp
+        }
+        mode => mode,
+    };
+
+    let settings = StageEngineSettings {
+        server_id: effective_args.server_id,
+        candidate_servers: effective_args.candidate_servers,
+        modern_pool_size: effective_args.modern_pool_size,
+        latency_samples: effective_args.latency_samples,
+        download_connections: effective_args.download_connections,
+        upload_connections: effective_args.upload_connections,
+        download_seconds: effective_args.download_seconds,
+        upload_seconds: effective_args.upload_seconds,
+        download_only: effective_args.download_only,
+        upload_only: effective_args.upload_only,
+        details: effective_args.details,
+        progress_interval: if effective_args.details {
+            Some(Duration::from_secs(1))
+        } else {
+            None
+        },
+    };
+
+    let outcome = engine::run_speedtest_engine(
+        &client,
+        &config,
+        &servers,
+        transfer_api,
+        &settings,
+        |event| engine::consume_event(&event),
+    )
+    .await?;
+
+    let _ = (
+        &outcome.selected_server,
+        &outcome.selected_latency,
+        &outcome.transfer_pool,
+    );
+
+    if let Some(output_path) = effective_args.sdk_json_out.as_deref() {
+        let body = serde_json::to_string_pretty(&outcome.sdk_payload)?;
+        std::fs::write(output_path, body)
+            .with_context(|| format!("failed writing SDK JSON file {output_path}"))?;
+    }
+
+    if effective_args.json {
+        if effective_args.details {
+            output::print_json(&outcome.result)?;
+        } else {
+            output::print_json(&outcome.sdk_payload)?;
+        }
+    } else {
+        output::print_human(&outcome.result);
     }
 
     Ok(())

@@ -11,6 +11,11 @@ use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 
+const LOADED_LATENCY_WORKERS: usize = 2;
+const LOADED_LATENCY_MAX_SAMPLES_PER_SEC: usize = 25;
+const LOADED_LATENCY_OUTLIER_LOWER_QUANTILE: f64 = 0.01;
+const LOADED_LATENCY_OUTLIER_UPPER_QUANTILE: f64 = 0.99;
+
 #[derive(Debug, Clone)]
 pub struct ServerLatency {
     pub server: SpeedtestServer,
@@ -143,7 +148,19 @@ pub async fn collect_loaded_latency_samples(
     };
 
     match outcome {
-        Ok(samples) => samples,
+        Ok(samples) => {
+            let raw_samples = samples.len();
+            let normalized = normalize_loaded_latency_samples(samples, stage_seconds);
+            debug!(
+                server_id = server.id,
+                host = %server.host,
+                stage_seconds,
+                raw_samples,
+                normalized_samples = normalized.len(),
+                "loaded latency samples normalized"
+            );
+            normalized
+        }
         Err(error) => {
             debug!(
                 server_id = server.id,
@@ -161,8 +178,6 @@ async fn collect_latency_modern_ws_for_duration(
     server: &SpeedtestServer,
     duration: Duration,
 ) -> Vec<f64> {
-    const LOADED_LATENCY_WORKERS: usize = 6;
-
     let mut tasks = JoinSet::new();
     for _ in 0..LOADED_LATENCY_WORKERS {
         let worker_server = server.clone();
@@ -196,6 +211,43 @@ async fn collect_latency_modern_ws_for_duration(
     }
 
     samples
+}
+
+fn normalize_loaded_latency_samples(mut samples: Vec<f64>, stage_seconds: u64) -> Vec<f64> {
+    samples.retain(|sample| sample.is_finite() && *sample >= 0.0 && *sample <= 10_000.0);
+    if samples.is_empty() {
+        return samples;
+    }
+
+    if samples.len() >= 20 {
+        let mut sorted = samples.clone();
+        sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+
+        let last_index = sorted.len() - 1;
+        let lower_index = ((last_index as f64) * LOADED_LATENCY_OUTLIER_LOWER_QUANTILE).floor();
+        let upper_index = ((last_index as f64) * LOADED_LATENCY_OUTLIER_UPPER_QUANTILE).ceil();
+        let lower_bound = sorted[lower_index as usize];
+        let upper_bound = sorted[upper_index as usize];
+
+        samples.retain(|sample| *sample >= lower_bound && *sample <= upper_bound);
+    }
+
+    let max_samples = stage_seconds.max(1) as usize * LOADED_LATENCY_MAX_SAMPLES_PER_SEC;
+    if samples.len() <= max_samples {
+        return samples;
+    }
+
+    let stride = samples.len() as f64 / max_samples as f64;
+    let mut downsampled = Vec::with_capacity(max_samples);
+    let mut cursor = 0.0_f64;
+
+    while downsampled.len() < max_samples {
+        let index = cursor.floor() as usize;
+        downsampled.push(samples[index.min(samples.len() - 1)]);
+        cursor += stride;
+    }
+
+    downsampled
 }
 
 async fn collect_latency_legacy_for_duration(
@@ -434,7 +486,9 @@ fn compare_latency(a: &ServerLatency, b: &ServerLatency) -> Option<Ordering> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerLatency, select_best_latency, select_nearest};
+    use super::{
+        ServerLatency, normalize_loaded_latency_samples, select_best_latency, select_nearest,
+    };
     use crate::speedtest::servers::SpeedtestServer;
 
     #[test]
@@ -483,6 +537,20 @@ mod tests {
 
         let best = select_best_latency(&ranked).expect("should pick a server");
         assert_eq!(best.server.id, 4);
+    }
+
+    #[test]
+    fn loaded_latency_normalization_filters_and_caps_samples() {
+        let mut samples = vec![f64::NAN, -1.0, 0.0, 1.0, 2.0, 3.0, 1000.0, 10000.1];
+        samples.extend((0..2_000).map(|value| 2.0 + (value % 5) as f64 * 0.01));
+
+        let normalized = normalize_loaded_latency_samples(samples, 10);
+
+        assert!(!normalized.is_empty());
+        assert!(normalized.len() <= 250);
+        assert!(normalized.iter().all(|sample| sample.is_finite()));
+        assert!(normalized.iter().all(|sample| *sample >= 0.0));
+        assert!(normalized.iter().all(|sample| *sample <= 10_000.0));
     }
 
     fn server(id: u64, distance_km: f64) -> SpeedtestServer {

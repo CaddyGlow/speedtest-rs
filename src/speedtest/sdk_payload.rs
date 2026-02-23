@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::debug;
 
 use crate::model::{BenchmarkResult, DirectionDetails, RunResult, Server, ThroughputInterval};
 
@@ -84,8 +85,13 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         .map(|entry| build_server_list_entry(entry, client))
         .collect::<Vec<_>>();
     let download_bps = result.download.as_ref().map(mbps_to_bps).transpose()?;
-    let upload_bps = result.upload.as_ref().map(mbps_to_bps).transpose()?;
-    let upload_remote_bps = upload_bps.map(|bps| remote_upload_bps(result).unwrap_or(bps));
+    let upload_effective_bps = result.upload.as_ref().map(mbps_to_bps).transpose()?;
+    let upload_local_bps = if upload_effective_bps.is_some() {
+        local_upload_bps(result).or(upload_effective_bps)
+    } else {
+        None
+    };
+    let upload_remote_bps = remote_upload_bps(result);
     let protocols = infer_protocols(result.speedtest_api.as_deref());
     let pings = selected_latency_samples(result).unwrap_or_else(|| vec![ping_ms]);
     let ping = latency_stats(&pings)
@@ -103,7 +109,7 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         .filter(|samples| !samples.is_empty())
         .unwrap_or_else(|| pings.clone());
     let download = download_bps.map(bps_to_sdk_units);
-    let upload = upload_bps.map(bps_to_sdk_units);
+    let upload = upload_effective_bps.map(bps_to_sdk_units);
     let (clientip, ip6_address) = split_client_ips(&client.ip);
     let latency =
         build_latency_payload(&pings, jitter, protocols.latency_connection_protocol, true);
@@ -136,7 +142,7 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
     } else {
         None
     };
-    let upload_samples = if upload_bps.is_some() {
+    let upload_samples = if upload_effective_bps.is_some() {
         build_direction_samples(
             result.sdk_upload_intervals.as_deref(),
             result
@@ -159,7 +165,7 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         result.download.as_ref().map(|stats| stats.duration_seconds),
     );
     let upload_local_speed_profile = build_speed_profile(
-        upload_bps,
+        upload_local_bps,
         upload_samples.as_deref(),
         result.upload.as_ref().map(|stats| stats.duration_seconds),
     );
@@ -177,6 +183,25 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         .or(upload_local_speed_profile.as_ref())
         .map(|profile| bps_to_sdk_units(profile.combined))
         .or(upload);
+    let upload_measurement_method = if upload_remote_speed_profile.is_some() {
+        "remote"
+    } else {
+        "local"
+    };
+
+    debug!(
+        upload_effective_bps = ?upload_effective_bps,
+        upload_local_bps = ?upload_local_bps,
+        upload_remote_bps = ?upload_remote_bps,
+        upload_sample_count = upload_samples.as_ref().map(|samples| samples.len()).unwrap_or(0),
+        upload_remote_sample_count = upload_remote_samples
+            .as_ref()
+            .map(|samples| samples.len())
+            .unwrap_or(0),
+        upload_measurement_method,
+        "building sdk upload speed profiles"
+    );
+
     let hash = calculate_result_hash(ping, upload, download);
 
     let payload = SdkPayload {
@@ -257,9 +282,9 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         server_selection_guid: guid.to_string(),
         server_selection_method: "auto".to_string(),
         server_selection,
-        upload_measurement_method: "remote".to_string(),
+        upload_measurement_method: upload_measurement_method.to_string(),
         upload,
-        upload_speeds: upload_bps.map(|_| SdkDirectionSpeeds {
+        upload_speeds: upload_effective_bps.map(|_| SdkDirectionSpeeds {
             local: upload_local_speed_profile,
             remote: upload_remote_speed_profile,
         }),
@@ -294,6 +319,14 @@ fn bps_to_sdk_units(bps: u64) -> u64 {
 }
 
 fn remote_upload_bps(result: &RunResult) -> Option<u64> {
+    if let Some(intervals) = result.sdk_upload_remote_intervals.as_ref()
+        && let Some(last) = intervals.last()
+        && last.mbps.is_finite()
+        && last.mbps >= 0.0
+    {
+        return Some((last.mbps * 1_000_000.0).round() as u64);
+    }
+
     let remote_mbps = result
         .details
         .as_ref()?
@@ -309,6 +342,31 @@ fn remote_upload_bps(result: &RunResult) -> Option<u64> {
     }
 
     Some((remote_mbps * 1_000_000.0).round() as u64)
+}
+
+fn local_upload_bps(result: &RunResult) -> Option<u64> {
+    if let Some(intervals) = result.sdk_upload_intervals.as_ref()
+        && let Some(last) = intervals.last()
+        && last.mbps.is_finite()
+        && last.mbps >= 0.0
+    {
+        return Some((last.mbps * 1_000_000.0).round() as u64);
+    }
+
+    let local_mbps = result
+        .details
+        .as_ref()?
+        .upload
+        .as_ref()?
+        .intervals
+        .last()?
+        .mbps;
+
+    if !local_mbps.is_finite() || local_mbps < 0.0 {
+        return None;
+    }
+
+    Some((local_mbps * 1_000_000.0).round() as u64)
 }
 
 fn infer_protocols(speedtest_api: Option<&str>) -> SdkProtocols {
@@ -619,7 +677,7 @@ fn calculate_average_speed_bps(samples: &[SdkTransferSample]) -> Option<f64> {
         .last()
         .map(|sample| sample.elapsed_ms)
         .filter(|value| value.is_finite() && *value > 0.0)?;
-    Some(total_bytes * 1_000.0 / elapsed_ms)
+    Some(total_bytes * 8.0 * 1_000.0 / elapsed_ms)
 }
 
 fn calculate_mst_speed_bps(
@@ -678,7 +736,7 @@ fn calculate_mst_speed_bps(
     if aggregate.duration_ms <= 0.0 {
         None
     } else {
-        Some(aggregate.bytes_transferred * 1_000.0 / aggregate.duration_ms)
+        Some(aggregate.bytes_transferred * 8.0 * 1_000.0 / aggregate.duration_ms)
     }
 }
 
@@ -727,7 +785,7 @@ fn calculate_superspeed_bps(
 
             let bytes = end.total_bytes_transferred as f64
                 - (start.total_bytes_transferred as f64 - start.bytes_transferred as f64);
-            let speed_bps = bytes * 1_000.0 / window_ms;
+            let speed_bps = bytes * 8.0 * 1_000.0 / window_ms;
             if speed_bps > best_bps {
                 best_bps = speed_bps;
             }
@@ -762,7 +820,7 @@ impl SdkThroughputBucket {
 
     fn bandwidth_bps(self) -> Option<f64> {
         let duration_ms = self.duration_ms()?;
-        Some(self.bytes_transferred as f64 * 1_000.0 / duration_ms)
+        Some(self.bytes_transferred as f64 * 8.0 * 1_000.0 / duration_ms)
     }
 
     fn to_bandwidth_sample(self) -> Option<BandwidthSample> {
@@ -1444,6 +1502,10 @@ mod tests {
         assert!(payload["downloadSpeeds"]["local"]["mst_66_20"].is_number());
         assert!(payload["downloadSpeeds"]["local"]["mst_66_30"].is_number());
         assert!(payload["downloadSpeeds"]["local"]["mst_75_30"].is_number());
+        assert_eq!(payload["downloadSpeeds"]["local"]["combined"], 222162000);
+        assert_eq!(payload["downloadSpeeds"]["local"]["average"], 222162000.0);
+        assert_eq!(payload["uploadSpeeds"]["local"]["combined"], 98950000);
+        assert_eq!(payload["uploadSpeeds"]["local"]["average"], 98950000.0);
         assert!(payload["serverSelection"]["closestPingDetails"].is_array());
         assert_eq!(payload["clientip"], "159.26.112.4");
         assert_eq!(payload["hash"].as_str().map(str::len), Some(32));

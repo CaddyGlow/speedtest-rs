@@ -65,6 +65,15 @@ where
     let response_read_errors = Arc::new(AtomicU64::new(0));
     let active_connections = Arc::new(AtomicUsize::new(0));
     let transfer_pool = normalize_server_pool(selected_server, server_pool);
+    let default_guid = selected_server
+        .session_guid
+        .clone()
+        .or_else(|| {
+            transfer_pool
+                .iter()
+                .find_map(|server| server.session_guid.clone())
+        })
+        .unwrap_or_else(|| "tunmux-speedtest".to_string());
     let per_server_bytes = Arc::new(
         transfer_pool
             .iter()
@@ -95,6 +104,7 @@ where
                 run_download_workers_modern_sdk(
                     client,
                     &transfer_pool,
+                    &default_guid,
                     worker_count,
                     stop_at,
                     &total_bytes,
@@ -339,6 +349,7 @@ async fn run_download_workers_modern(
 async fn run_download_workers_modern_sdk(
     client: &Client,
     server_pool: &[SpeedtestServer],
+    default_guid: &str,
     worker_count: usize,
     stop_at: Instant,
     total_bytes: &Arc<AtomicU64>,
@@ -360,10 +371,11 @@ async fn run_download_workers_modern_sdk(
         let worker_client = client.clone();
         let server_index = worker % server_pool.len();
         let worker_server = server_pool[server_index].clone();
+        let worker_default_guid = default_guid.to_string();
         let worker_guid = worker_server
             .session_guid
             .clone()
-            .unwrap_or_else(|| "tunmux-speedtest".to_string());
+            .unwrap_or(worker_default_guid);
         let worker_bytes = Arc::clone(total_bytes);
         let worker_attempts = Arc::clone(request_attempts);
         let worker_successes = Arc::clone(request_successes);
