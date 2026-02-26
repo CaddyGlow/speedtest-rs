@@ -15,6 +15,7 @@ It is intentionally separate from the `tunmux` workspace and has no dependency o
 - modern session cache for cookies, guid, and client auth token
 - native `iperf` command with dedicated JSON schema (`tunmux.iperf.v1`)
 - live progress output with optional disable flag
+- live connectivity hook shows country/city/ip/org from ipinfo
 - human readable output plus SDK-compatible JSON output
 
 ## Status
@@ -65,7 +66,6 @@ cargo run -- run --mode xhr
 cargo run -- run --mode tcp
 cargo run -- run --pool-size 4
 cargo run -- run --json
-cargo run -- run --json --details
 cargo run -- run --sdk-json-out speedtest-sdk-result.json
 RUST_LOG=debug cargo run -- run --mode tcp --pool-size 8 --
 ```
@@ -73,7 +73,6 @@ RUST_LOG=debug cargo run -- run --mode tcp --pool-size 8 --
 Modern session cache path:
 
 - `run --json` emits a Speedtest SDK-style payload (`st4-js` model)
-- `run --json --details` emits the native `RunResult` diagnostic schema with interval counters
 
 - `${XDG_CACHE_HOME}/tunmux-speedtest/modern-session.json` when `XDG_CACHE_HOME` is set
 - `~/.cache/tunmux-speedtest/modern-session.json` otherwise

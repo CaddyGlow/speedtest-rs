@@ -101,31 +101,69 @@ struct ParsedSdkCatalog {
     provider_hash: Option<String>,
 }
 
-pub async fn fetch_servers(client: &Client, limit: usize) -> Result<Vec<SpeedtestServer>> {
+pub async fn fetch_servers(
+    client: &Client,
+    limit: usize,
+    selected_server_id: Option<u64>,
+) -> Result<Vec<SpeedtestServer>> {
     let fetched = fetch_modern_sdk_servers(client, limit).await?;
     if fetched.is_empty() {
         bail!("modern speedtest server catalog returned no usable servers");
     }
-    merge_with_cache_and_persist(fetched)
+    merge_with_cache_and_persist(fetched, selected_server_id)
 }
 
-fn merge_with_cache_and_persist(fetched: Vec<SpeedtestServer>) -> Result<Vec<SpeedtestServer>> {
+fn merge_with_cache_and_persist(
+    fetched: Vec<SpeedtestServer>,
+    selected_server_id: Option<u64>,
+) -> Result<Vec<SpeedtestServer>> {
     let cached = load_cached_servers().unwrap_or_default();
-    let merged = merge_server_catalog(fetched, cached);
-    let cache_copy = merged
-        .iter()
-        .cloned()
+    let (runtime_catalog, cache_copy) =
+        build_runtime_and_cache_catalogs(fetched, cached, selected_server_id);
+
+    if let Err(error) = write_cached_servers(&cache_copy) {
+        eprintln!("failed to update speedtest server cache: {}", error);
+    }
+
+    Ok(runtime_catalog)
+}
+
+fn build_runtime_and_cache_catalogs(
+    fetched: Vec<SpeedtestServer>,
+    cached: Vec<SpeedtestServer>,
+    selected_server_id: Option<u64>,
+) -> (Vec<SpeedtestServer>, Vec<SpeedtestServer>) {
+    let runtime_catalog = build_runtime_catalog(&fetched, &cached, selected_server_id);
+    let cache_catalog = merge_server_catalog(fetched, cached)
+        .into_iter()
         .map(|mut server| {
             server.session_guid = None;
             server
         })
         .collect::<Vec<_>>();
 
-    if let Err(error) = write_cached_servers(&cache_copy) {
-        eprintln!("failed to update speedtest server cache: {}", error);
+    (runtime_catalog, cache_catalog)
+}
+
+fn build_runtime_catalog(
+    fetched: &[SpeedtestServer],
+    cached: &[SpeedtestServer],
+    selected_server_id: Option<u64>,
+) -> Vec<SpeedtestServer> {
+    let mut runtime_catalog = fetched.to_vec();
+    let Some(server_id) = selected_server_id else {
+        return runtime_catalog;
+    };
+
+    if runtime_catalog.iter().any(|server| server.id == server_id) {
+        return runtime_catalog;
     }
 
-    Ok(merged)
+    if let Some(cached_server) = cached.iter().find(|server| server.id == server_id).cloned() {
+        runtime_catalog.push(cached_server);
+    }
+
+    runtime_catalog
 }
 
 async fn fetch_modern_sdk_servers(client: &Client, limit: usize) -> Result<Vec<SpeedtestServer>> {
@@ -403,8 +441,8 @@ pub fn cache_file_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SpeedtestServer, filter_servers, merge_server_catalog, parse_sdk_catalog_json,
-        parse_servers_sdk_json,
+        SpeedtestServer, build_runtime_and_cache_catalogs, filter_servers, merge_server_catalog,
+        parse_sdk_catalog_json, parse_servers_sdk_json,
     };
 
     #[test]
@@ -474,6 +512,60 @@ mod tests {
         assert_eq!(merged[1].id, 2);
         assert_eq!(merged[1].sponsor, "fresh-2");
         assert_eq!(merged[2].id, 3);
+    }
+
+    #[test]
+    fn runtime_catalog_uses_only_fetched_servers() {
+        let mut fetched = server(1, "fresh-1");
+        fetched.session_guid = Some("guid-1".to_string());
+        let mut cached = server(2, "old-2");
+        cached.session_guid = Some("guid-2".to_string());
+
+        let (runtime, cache_catalog) =
+            build_runtime_and_cache_catalogs(vec![fetched.clone()], vec![cached], None);
+
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].id, 1);
+        assert_eq!(runtime[0].session_guid.as_deref(), Some("guid-1"));
+
+        assert_eq!(cache_catalog.len(), 2);
+        assert_eq!(cache_catalog[0].id, 1);
+        assert_eq!(cache_catalog[1].id, 2);
+        assert!(
+            cache_catalog
+                .iter()
+                .all(|server| server.session_guid.is_none())
+        );
+    }
+
+    #[test]
+    fn runtime_catalog_includes_cached_server_only_for_requested_id() {
+        let fetched = vec![server(1, "fresh-1")];
+        let mut cached = server(2, "old-2");
+        cached.session_guid = Some("guid-2".to_string());
+
+        let (runtime, _cache_catalog) =
+            build_runtime_and_cache_catalogs(fetched, vec![cached], Some(2));
+
+        assert_eq!(runtime.len(), 2);
+        assert_eq!(runtime[0].id, 1);
+        assert_eq!(runtime[1].id, 2);
+        assert_eq!(runtime[1].session_guid.as_deref(), Some("guid-2"));
+    }
+
+    #[test]
+    fn runtime_catalog_prefers_api_server_when_requested_id_exists() {
+        let mut fetched_server = server(2, "fresh-2");
+        fetched_server.host = "api-host".to_string();
+        let mut cached_server = server(2, "old-2");
+        cached_server.host = "cached-host".to_string();
+
+        let (runtime, _cache_catalog) =
+            build_runtime_and_cache_catalogs(vec![fetched_server], vec![cached_server], Some(2));
+
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].id, 2);
+        assert_eq!(runtime[0].host, "api-host");
     }
 
     #[test]

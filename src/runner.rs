@@ -157,6 +157,24 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     ui.render_metric("mode", &effective_args.mode.to_string());
     ui.render_metric("pool_size", &effective_args.pool_size.to_string());
 
+    if render_ui {
+        ui.render_phase("fetching connectivity info");
+        match speedtest::ipinfo::fetch_ipinfo(&client).await {
+            Ok(ipinfo) => {
+                ui.render_metric("country", ipinfo.country.as_deref().unwrap_or("unknown"));
+                ui.render_metric("city", ipinfo.city.as_deref().unwrap_or("unknown"));
+                ui.render_metric("ip", ipinfo.ip.as_deref().unwrap_or("unknown"));
+                ui.render_metric("org", ipinfo.org.as_deref().unwrap_or("unknown"));
+            }
+            Err(_) => {
+                ui.render_metric("country", "unknown");
+                ui.render_metric("city", "unknown");
+                ui.render_metric("ip", "unknown");
+                ui.render_metric("org", "unknown");
+            }
+        }
+    }
+
     ui.render_phase("fetching speedtest config");
     let config = with_ctrl_c(speedtest::config::fetch_config(&client)).await?;
 
@@ -167,7 +185,12 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     } else {
         effective_args.candidate_servers.max(25)
     };
-    let servers = with_ctrl_c(speedtest::servers::fetch_servers(&client, fetch_limit)).await?;
+    let servers = with_ctrl_c(speedtest::servers::fetch_servers(
+        &client,
+        fetch_limit,
+        effective_args.server_id,
+    ))
+    .await?;
     ui.render_metric("catalog_servers", &servers.len().to_string());
 
     let server_names = servers
@@ -177,9 +200,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
 
     let progress_interval = if render_ui {
         ui.progress_interval()
-            .or_else(|| effective_args.details.then_some(Duration::from_secs(1)))
-    } else if effective_args.details {
-        Some(Duration::from_secs(1))
     } else {
         None
     };
@@ -197,7 +217,7 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         upload_seconds: effective_args.upload_seconds,
         download_only: effective_args.download_only,
         upload_only: effective_args.upload_only,
-        details: effective_args.details,
+        details: false,
         progress_interval,
     };
 
@@ -407,11 +427,7 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     }
 
     if effective_args.json {
-        if effective_args.details {
-            output::print_json(&outcome.result)?;
-        } else {
-            output::print_json(&outcome.sdk_payload)?;
-        }
+        output::print_json(&outcome.sdk_payload)?;
     } else {
         output::print_human(&outcome.result);
     }

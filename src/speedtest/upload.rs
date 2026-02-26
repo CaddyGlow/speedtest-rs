@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -22,6 +23,8 @@ const REMOTE_STATS_BACKGROUND_UPLOAD_BYTES: usize = 32 * 1024;
 const REMOTE_STATS_BACKGROUND_UPLOAD_INTERVAL_MS: u64 = 500;
 const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STAGE_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+const SERVER_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
+const UPLOAD_READINESS_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct UploadStats {
@@ -58,8 +61,6 @@ where
     F: FnMut(UploadProgress),
 {
     let worker_count = clamp_worker_count(connections);
-    let start_at = Instant::now();
-    let stop_at = start_at + Duration::from_secs(seconds);
     let total_bytes = Arc::new(AtomicU64::new(0));
     let request_attempts = Arc::new(AtomicU64::new(0));
     let request_successes = Arc::new(AtomicU64::new(0));
@@ -77,6 +78,16 @@ where
                 .find_map(|server| server.session_guid.clone())
         })
         .unwrap_or_else(|| "tunmux-speedtest".to_string());
+    let ready_pool = resolve_ready_upload_pool(client, mode, &transfer_pool, &default_guid).await;
+    if ready_pool.is_empty() {
+        bail!("no speedtest servers became ready for upload stage");
+    }
+    let selected_server_ready = ready_pool
+        .iter()
+        .any(|server| server.id == selected_server.id);
+
+    let start_at = Instant::now();
+    let mut stage_end_at = start_at + Duration::from_secs(seconds);
     let mut upload_stats_task = None;
     let mut remote_stats_background_task = None;
     let mut remote_stats_background_stop = None;
@@ -84,8 +95,10 @@ where
     let mut latest_remote_sample = None;
     let mut remote_samples = Vec::new();
     let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
+    let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
 
     if matches!(mode, TransportProtocol::Xhr)
+        && selected_server_ready
         && let Some(guid) = selected_server
             .session_guid
             .clone()
@@ -138,10 +151,9 @@ where
         TransportProtocol::Xhr => {
             run_upload_workers_modern_sdk(
                 client,
-                &transfer_pool,
+                &ready_pool,
                 &default_guid,
                 worker_count,
-                stop_at,
                 &total_bytes,
                 &request_attempts,
                 &request_successes,
@@ -150,14 +162,14 @@ where
                 &response_read_errors,
                 &active_connections,
                 &stage_stop_rx,
+                &first_transfer_tx,
                 &mut tasks,
             );
         }
         TransportProtocol::Tcp => {
             run_upload_workers_modern(
-                &transfer_pool,
+                &ready_pool,
                 worker_count,
-                stop_at,
                 &total_bytes,
                 &request_attempts,
                 &request_successes,
@@ -165,20 +177,38 @@ where
                 &response_read_errors,
                 &active_connections,
                 &stage_stop_rx,
+                &first_transfer_tx,
                 &mut tasks,
             );
         }
     }
 
-    let stage_deadline = sleep(stop_at.duration_since(start_at));
-    tokio::pin!(stage_deadline);
     let poll_interval = progress_interval.unwrap_or(STAGE_POLL_INTERVAL);
+    let mut progress_clock_start = None;
+    let mut transfer_started = false;
 
     loop {
+        if !transfer_started && *first_transfer_rx.borrow() {
+            let now = Instant::now();
+            transfer_started = true;
+            stage_end_at = now + Duration::from_secs(seconds);
+            progress_clock_start = Some(now);
+        }
+
+        if Instant::now() >= stage_end_at {
+            let _ = stage_stop_tx.send(true);
+            break;
+        }
+
         tokio::select! {
             joined = tasks.join_next() => {
                 if joined.is_none() {
                     break;
+                }
+            }
+            changed = first_transfer_rx.changed() => {
+                if changed.is_err() {
+                    continue;
                 }
             }
             _ = sleep(poll_interval) => {
@@ -190,9 +220,12 @@ where
                         }
                     }
 
-                    let elapsed = start_at.elapsed();
-                    let elapsed_secs = elapsed.as_secs().max(1);
+                    let now = Instant::now();
                     let local_bytes = total_bytes.load(Ordering::Relaxed);
+                    let elapsed = progress_clock_start
+                        .map(|clock_start| now.saturating_duration_since(clock_start))
+                        .unwrap_or_default();
+                    let elapsed_secs = elapsed.as_secs().max(1);
                     let local_mbps = mbps_from_bytes(local_bytes, elapsed_secs);
 
                     if let Some(sample) = latest_remote_sample {
@@ -206,10 +239,6 @@ where
                         active_connections: active_connections.load(Ordering::Relaxed),
                     });
                 }
-            }
-            _ = &mut stage_deadline => {
-                let _ = stage_stop_tx.send(true);
-                break;
             }
         }
     }
@@ -340,11 +369,68 @@ fn normalize_server_pool(
     }
 }
 
+async fn resolve_ready_upload_pool(
+    client: &Client,
+    mode: TransportProtocol,
+    server_pool: &[SpeedtestServer],
+    default_guid: &str,
+) -> Vec<SpeedtestServer> {
+    let mut tasks = JoinSet::new();
+    for server in server_pool.iter().cloned() {
+        let probe_client = client.clone();
+        let guid = server
+            .session_guid
+            .clone()
+            .unwrap_or_else(|| default_guid.to_string());
+        tasks.spawn(async move {
+            let is_ready = match mode {
+                TransportProtocol::Tcp => {
+                    match timeout(SERVER_READINESS_TIMEOUT, modern_protocol::connect(&server)).await
+                    {
+                        Ok(Ok(mut stream)) => {
+                            let _ = modern_protocol::quit(&mut stream).await;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                TransportProtocol::Xhr => matches!(
+                    timeout(
+                        SERVER_READINESS_TIMEOUT,
+                        browser_protocol::upload(
+                            &probe_client,
+                            &server,
+                            &guid,
+                            vec![0x52_u8; UPLOAD_READINESS_BYTES],
+                        ),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ),
+            };
+
+            (server.id, is_ready)
+        });
+    }
+
+    let mut ready_ids = HashSet::new();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((server_id, true)) = joined {
+            ready_ids.insert(server_id);
+        }
+    }
+
+    server_pool
+        .iter()
+        .filter(|server| ready_ids.contains(&server.id))
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_upload_workers_modern(
     server_pool: &[SpeedtestServer],
     worker_count: usize,
-    stop_at: Instant,
     total_bytes: &Arc<AtomicU64>,
     request_attempts: &Arc<AtomicU64>,
     request_successes: &Arc<AtomicU64>,
@@ -352,6 +438,7 @@ fn run_upload_workers_modern(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     stop_rx: &watch::Receiver<bool>,
+    first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
@@ -367,13 +454,15 @@ fn run_upload_workers_modern(
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
         let mut worker_stop = stop_rx.clone();
+        let worker_first_transfer_tx = first_transfer_tx.clone();
 
         tasks.spawn(async move {
             const REQUEST_SIZE: usize = 25_000_000;
             let mut stream = None;
             let mut stream_connected = false;
+            let mut signaled_first_transfer = false;
 
-            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
+            while !*worker_stop.borrow_and_update() {
                 if stream.is_none() {
                     let maybe_connected = tokio::select! {
                         connected = modern_protocol::connect(&worker_server) => Some(connected),
@@ -381,7 +470,7 @@ fn run_upload_workers_modern(
                     };
 
                     match maybe_connected {
-                    Some(Ok(connected)) => {
+                        Some(Ok(connected)) => {
                             stream = Some(connected);
                             if !stream_connected {
                                 worker_active_connections.fetch_add(1, Ordering::Relaxed);
@@ -413,6 +502,10 @@ fn run_upload_workers_modern(
                     Some(Ok(uploaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(uploaded, Ordering::Relaxed);
+                        if uploaded > 0 && !signaled_first_transfer {
+                            let _ = worker_first_transfer_tx.send(true);
+                            signaled_first_transfer = true;
+                        }
                     }
                     Some(Err(_)) => {
                         worker_read_errors.fetch_add(1, Ordering::Relaxed);
@@ -443,7 +536,6 @@ fn run_upload_workers_modern_sdk(
     server_pool: &[SpeedtestServer],
     default_guid: &str,
     worker_count: usize,
-    stop_at: Instant,
     total_bytes: &Arc<AtomicU64>,
     request_attempts: &Arc<AtomicU64>,
     request_successes: &Arc<AtomicU64>,
@@ -452,6 +544,7 @@ fn run_upload_workers_modern_sdk(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     stop_rx: &watch::Receiver<bool>,
+    first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
 ) {
     if server_pool.is_empty() {
@@ -474,6 +567,7 @@ fn run_upload_workers_modern_sdk(
         let worker_read_errors = Arc::clone(response_read_errors);
         let worker_active_connections = Arc::clone(active_connections);
         let mut worker_stop = stop_rx.clone();
+        let worker_first_transfer_tx = first_transfer_tx.clone();
 
         tasks.spawn(async move {
             const SIZES: [usize; 5] = [
@@ -484,8 +578,9 @@ fn run_upload_workers_modern_sdk(
                 4 * 1024 * 1024,
             ];
             let mut cursor = worker % SIZES.len();
+            let mut signaled_first_transfer = false;
 
-            while Instant::now() < stop_at && !*worker_stop.borrow_and_update() {
+            while !*worker_stop.borrow_and_update() {
                 let size = SIZES[cursor];
                 cursor = (cursor + 1) % SIZES.len();
                 worker_attempts.fetch_add(1, Ordering::Relaxed);
@@ -506,6 +601,10 @@ fn run_upload_workers_modern_sdk(
                     Some(Ok(uploaded)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
                         worker_bytes.fetch_add(uploaded, Ordering::Relaxed);
+                        if uploaded > 0 && !signaled_first_transfer {
+                            let _ = worker_first_transfer_tx.send(true);
+                            signaled_first_transfer = true;
+                        }
                     }
                     Some(Err(error)) => match error {
                         browser_protocol::TransferRequestError::HttpStatus => {

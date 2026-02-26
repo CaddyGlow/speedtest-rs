@@ -90,7 +90,9 @@ pub struct RunArgs {
     pub upload_only: bool,
 
     /// Optional HTTP/HTTPS/SOCKS5 proxy URL (falls back to http_proxy/https_proxy/all_proxy env vars)
-    #[arg(long)]
+    ///
+    /// `--proxy-local` is kept as an alias for compatibility.
+    #[arg(long, alias = "proxy-local")]
     pub proxy: Option<String>,
 
     /// Disable live progress rendering
@@ -104,10 +106,6 @@ pub struct RunArgs {
     /// Write SDK-compatible result JSON payload to file
     #[arg(long, value_name = "PATH")]
     pub sdk_json_out: Option<String>,
-
-    /// Include interval and diagnostic details in JSON output
-    #[arg(long, requires = "json")]
-    pub details: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -158,7 +156,9 @@ pub struct IperfArgs {
     pub bitrate: Option<u64>,
 
     /// Optional HTTP/SOCKS5 proxy URL (falls back to http_proxy/https_proxy/all_proxy env vars)
-    #[arg(long)]
+    ///
+    /// `--proxy-local` is kept as an alias for compatibility.
+    #[arg(long, alias = "proxy-local")]
     pub proxy: Option<String>,
 
     /// Skip download direction
@@ -225,7 +225,6 @@ impl Default for Cli {
                 no_progress: false,
                 json: false,
                 sdk_json_out: None,
-                details: false,
             })),
         }
     }
@@ -284,26 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_run_details_without_json() {
-        let parse = Cli::try_parse_from(["tunmux-speedtest", "run", "--details"]);
-
-        assert!(parse.is_err());
-    }
-
-    #[test]
-    fn accepts_run_details_with_json() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--json", "--details"])
-            .expect("run --json --details should parse");
-
-        let Some(Command::Run(args)) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert!(args.json);
-        assert!(args.details);
-    }
-
-    #[test]
     fn parses_modern_transport_mode() {
         let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--mode", "tcp"])
             .expect("run --mode tcp should parse");
@@ -330,6 +309,23 @@ mod tests {
         };
 
         assert_eq!(args.sdk_json_out.as_deref(), Some("sdk-result.json"));
+    }
+
+    #[test]
+    fn parses_run_proxy_local_alias() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "run",
+            "--proxy-local",
+            "http://127.0.0.1:8080",
+        ])
+        .expect("run --proxy-local should parse");
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.proxy.as_deref(), Some("http://127.0.0.1:8080"));
     }
 
     #[test]
@@ -458,6 +454,25 @@ mod tests {
         };
 
         assert!(args.no_progress);
+    }
+
+    #[test]
+    fn parses_iperf_proxy_local_alias() {
+        let cli = Cli::try_parse_from([
+            "tunmux-speedtest",
+            "iperf",
+            "--host",
+            "127.0.0.1",
+            "--proxy-local",
+            "socks5h://127.0.0.1:1080",
+        ])
+        .expect("iperf --proxy-local should parse");
+
+        let Some(Command::Iperf(args)) = cli.command else {
+            panic!("expected iperf command");
+        };
+
+        assert_eq!(args.proxy.as_deref(), Some("socks5h://127.0.0.1:1080"));
     }
 
     #[test]
