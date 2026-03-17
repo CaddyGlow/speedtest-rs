@@ -716,6 +716,7 @@ pub async fn upload_streaming(
 
         let response = match browser_headers(client.post(url.clone()))
             .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", body_len)
             .body(body)
             .send()
             .await
