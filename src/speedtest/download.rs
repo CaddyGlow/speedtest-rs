@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -15,7 +14,10 @@ use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
-use crate::speedtest::transfer_util::{ActiveConnectionGuard, normalize_server_pool};
+use crate::speedtest::transfer_util::{
+    ActiveConnectionGuard, drain_join_set, elapsed_ms_since, normalize_server_pool,
+    resolve_ready_server_pool,
+};
 use crate::util::{clamp_worker_count, mbps_from_bytes};
 
 const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -251,22 +253,10 @@ where
         }
     }
 
-    let drained = timeout(STAGE_JOIN_GRACE_PERIOD, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await;
-    if drained.is_err() {
-        tasks.abort_all();
-        let _ = timeout(STAGE_JOIN_GRACE_PERIOD, async {
-            while tasks.join_next().await.is_some() {}
-        })
-        .await;
-    }
+    drain_join_set(&mut tasks, STAGE_JOIN_GRACE_PERIOD).await;
 
     let throughput_result = calc.finish();
-    let actual_duration_ms = progress_clock_start
-        .map(|start| Instant::now().saturating_duration_since(start).as_millis() as u64)
-        .unwrap_or(0);
+    let actual_duration_ms = elapsed_ms_since(progress_clock_start);
     let bytes = total_bytes.load(Ordering::Relaxed);
     let per_server = ready_pool
         .iter()
@@ -301,15 +291,11 @@ async fn resolve_ready_download_pool(
     server_pool: &[SpeedtestServer],
     default_guid: &str,
 ) -> Vec<SpeedtestServer> {
-    let mut tasks = JoinSet::new();
-    for server in server_pool.iter().cloned() {
-        let probe_client = client.clone();
-        let guid = server
-            .session_guid
-            .clone()
-            .unwrap_or_else(|| default_guid.to_string());
-        tasks.spawn(async move {
-            let is_ready = match mode {
+    let probe_client = client.clone();
+    resolve_ready_server_pool(server_pool, default_guid, move |server, guid| {
+        let probe_client = probe_client.clone();
+        async move {
+            match mode {
                 TransportProtocol::Tcp => {
                     match timeout(SERVER_READINESS_TIMEOUT, modern_protocol::connect(&server)).await
                     {
@@ -333,24 +319,10 @@ async fn resolve_ready_download_pool(
                     .await,
                     Ok(Ok(_))
                 ),
-            };
-
-            (server.id, is_ready)
-        });
-    }
-
-    let mut ready_ids = HashSet::new();
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok((server_id, true)) = joined {
-            ready_ids.insert(server_id);
+            }
         }
-    }
-
-    server_pool
-        .iter()
-        .filter(|server| ready_ids.contains(&server.id))
-        .cloned()
-        .collect()
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
