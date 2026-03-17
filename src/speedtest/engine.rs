@@ -142,12 +142,15 @@ impl EngineSettings {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct EngineOutcome {
     pub result: RunResult,
     pub sdk_payload: Value,
     pub selected_server: SpeedtestServer,
+    #[allow(dead_code)]
     pub selected_latency: LatencyMeasurement,
+    #[allow(dead_code)]
     pub transfer_pool: Vec<SpeedtestServer>,
 }
 
@@ -928,6 +931,7 @@ mod tests {
     fn calculates_rtt_summary() {
         let samples = vec![15.0, 16.0, 17.0, 18.0];
         let summary = calculate_rtt(&samples).expect("summary should exist");
+        assert!((summary.iqm - 16.5).abs() < 1e-9);
         assert!((summary.mean - 16.5).abs() < 1e-9);
         assert!((summary.min - 15.0).abs() < 1e-9);
         assert!((summary.max - 18.0).abs() < 1e-9);

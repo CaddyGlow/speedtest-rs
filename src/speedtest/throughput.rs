@@ -48,6 +48,7 @@ impl Bucket {
 }
 
 /// Comprehensive throughput result from all MST algorithms.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct ThroughputResult {
     pub average_bps: f64,
@@ -200,6 +201,7 @@ impl ThroughputCalculator {
     ///
     /// Requires at least `min_duration_ms` elapsed and a coefficient of variation
     /// below 0.05 across the last 6 × 500ms buckets.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn should_stop_early(&self, min_duration_ms: u64) -> bool {
         if self.last_elapsed_ms < min_duration_ms {
             return false;

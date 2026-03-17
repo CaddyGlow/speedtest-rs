@@ -78,10 +78,6 @@ pub async fn download(
     Ok(total)
 }
 
-pub async fn upload(stream: &mut TcpStream, total_size: usize) -> Result<u64> {
-    upload_with_progress(stream, total_size, &[], &OnceLock::new(), None).await
-}
-
 pub async fn upload_with_progress(
     stream: &mut TcpStream,
     total_size: usize,
