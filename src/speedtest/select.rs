@@ -12,13 +12,9 @@ use crate::speedtest::browser_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 
 const LATENCY_PROBE_WORKERS: usize = 8;
-#[allow(dead_code)]
 const LOADED_LATENCY_WORKERS: usize = 8;
-#[allow(dead_code)]
 const LOADED_LATENCY_MAX_SAMPLES_PER_SEC: usize = 25;
-#[allow(dead_code)]
 const LOADED_LATENCY_OUTLIER_LOWER_QUANTILE: f64 = 0.01;
-#[allow(dead_code)]
 const LOADED_LATENCY_OUTLIER_UPPER_QUANTILE: f64 = 0.99;
 
 #[derive(Debug, Clone)]
@@ -135,7 +131,6 @@ pub async fn probe_server_latency(
     probe_server_latency_detailed(client, server, samples).await
 }
 
-#[allow(dead_code)]
 pub async fn collect_loaded_latency_samples(
     client: &Client,
     server: &SpeedtestServer,
@@ -166,7 +161,6 @@ pub async fn collect_loaded_latency_samples(
     normalized
 }
 
-#[allow(dead_code)]
 async fn collect_latency_modern_ws_for_duration(
     server: &SpeedtestServer,
     duration: Duration,
@@ -206,7 +200,6 @@ async fn collect_latency_modern_ws_for_duration(
     samples
 }
 
-#[allow(dead_code)]
 fn normalize_loaded_latency_samples(mut samples: Vec<f64>, stage_seconds: u64) -> Vec<f64> {
     samples.retain(|sample| sample.is_finite() && *sample >= 0.0 && *sample <= 10_000.0);
     if samples.is_empty() {

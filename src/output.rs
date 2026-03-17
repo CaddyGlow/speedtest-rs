@@ -106,15 +106,29 @@ pub fn print_human(result: &RunResult) {
 
     println!("{}", theme.section("Results"));
     if let Some(ping) = result.ping_ms {
+        let jitter_suffix = result
+            .jitter_ms
+            .map(|j| format!(" (jitter {})", theme.paint(&format!("{j:.2}ms"), latency_color(j))))
+            .unwrap_or_default();
         println!(
-            "  {} {}",
+            "  {} {}{}",
             theme.badge("PING", latency_color(ping)),
-            theme.paint(&format!("{ping:.2} ms"), latency_color(ping))
+            theme.paint(&format!("{ping:.2} ms"), latency_color(ping)),
+            jitter_suffix
         );
     }
     if let Some(download) = &result.download {
+        let latency_suffix = result
+            .download_latency_ms
+            .map(|l| {
+                format!(
+                    " latency {}",
+                    theme.paint(&format!("{l:.2}ms"), latency_color(l))
+                )
+            })
+            .unwrap_or_default();
         println!(
-            "  {} {}  {} in {}s ({} workers)",
+            "  {} {}  {} in {}s ({} workers){}",
             theme.badge("DOWN", throughput_color(download.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", download.mbps),
@@ -122,12 +136,22 @@ pub fn print_human(result: &RunResult) {
             ),
             format_bytes(download.bytes),
             download.duration_seconds,
-            download.connections
+            download.connections,
+            latency_suffix
         );
     }
     if let Some(upload) = &result.upload {
+        let latency_suffix = result
+            .upload_latency_ms
+            .map(|l| {
+                format!(
+                    " latency {}",
+                    theme.paint(&format!("{l:.2}ms"), latency_color(l))
+                )
+            })
+            .unwrap_or_default();
         println!(
-            "  {} {}  {} in {}s ({} workers)",
+            "  {} {}  {} in {}s ({} workers){}",
             theme.badge("UP", throughput_color(upload.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", upload.mbps),
@@ -135,7 +159,8 @@ pub fn print_human(result: &RunResult) {
             ),
             format_bytes(upload.bytes),
             upload.duration_seconds,
-            upload.connections
+            upload.connections,
+            latency_suffix
         );
     }
     println!(

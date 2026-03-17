@@ -571,6 +571,15 @@ pub async fn download(
     _guid: &str,
     size: usize,
 ) -> std::result::Result<u64, TransferRequestError> {
+    download_streaming(client, server, size, &[]).await
+}
+
+pub async fn download_streaming(
+    client: &Client,
+    server: &SpeedtestServer,
+    size: usize,
+    live_counters: &[&AtomicU64],
+) -> std::result::Result<u64, TransferRequestError> {
     let mut last_error = None;
 
     for mut url in
@@ -609,13 +618,32 @@ pub async fn download(
             continue;
         }
 
-        match response.bytes().await {
-            Ok(body) => return Ok(body.len() as u64),
-            Err(error) => {
-                debug!(server_id = server.id, endpoint = %url, error = %error, "download response read failed");
-                last_error = Some(TransferRequestError::ResponseRead);
+        let mut total = 0_u64;
+        let mut stream = response.bytes_stream();
+        let mut had_error = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let len = bytes.len() as u64;
+                    total += len;
+                    for counter in live_counters {
+                        counter.fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+                Err(error) => {
+                    debug!(server_id = server.id, endpoint = %url, error = %error, "download stream read failed");
+                    had_error = true;
+                    break;
+                }
             }
         }
+
+        if had_error && total == 0 {
+            last_error = Some(TransferRequestError::ResponseRead);
+            continue;
+        }
+
+        return Ok(total);
     }
 
     Err(last_error.unwrap_or(TransferRequestError::InvalidEndpoint))
@@ -625,7 +653,7 @@ pub async fn upload(
     client: &Client,
     server: &SpeedtestServer,
     _guid: &str,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> std::result::Result<u64, TransferRequestError> {
     let body_len = payload.len() as u64;
     let mut last_error = None;
@@ -633,7 +661,7 @@ pub async fn upload(
     for url in endpoint_urls(server, "upload").map_err(|_| TransferRequestError::InvalidEndpoint)? {
         let response = match browser_headers(client.post(url.clone()))
             .header("Content-Type", "application/octet-stream")
-            .body(payload.clone())
+            .body(payload.to_vec())
             .send()
             .await
         {
@@ -800,7 +828,7 @@ fn host_with_port(server: &SpeedtestServer) -> Result<String> {
     }
 }
 
-fn looks_like_host_with_port(host: &str) -> bool {
+pub(crate) fn looks_like_host_with_port(host: &str) -> bool {
     if host.starts_with('[') && host.contains(":") && host.contains("]:") {
         return true;
     }

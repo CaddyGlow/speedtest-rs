@@ -186,7 +186,7 @@ where
 
                 let remote_json = match timeout(
                     Duration::from_secs(4),
-                    read_json_frame(&mut control, None),
+                    read_json_frame(&mut control, Some(16 * 1024 * 1024)),
                 )
                 .await
                 {

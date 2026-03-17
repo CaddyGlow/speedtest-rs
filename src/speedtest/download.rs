@@ -13,6 +13,7 @@ use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
+use crate::speedtest::transfer_util::{ActiveConnectionGuard, normalize_server_pool};
 use crate::util::{clamp_worker_count, mbps_from_bytes};
 
 const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -215,17 +216,6 @@ where
     })
 }
 
-fn normalize_server_pool(
-    selected_server: &SpeedtestServer,
-    server_pool: &[SpeedtestServer],
-) -> Vec<SpeedtestServer> {
-    if server_pool.is_empty() {
-        vec![selected_server.clone()]
-    } else {
-        server_pool.to_vec()
-    }
-}
-
 async fn resolve_ready_download_pool(
     client: &Client,
     mode: TransportProtocol,
@@ -418,7 +408,7 @@ fn run_download_workers_modern_sdk(
         let server_index = worker % server_pool.len();
         let worker_server = server_pool[server_index].clone();
         let worker_default_guid = default_guid.to_string();
-        let worker_guid = worker_server
+        let _worker_guid = worker_server
             .session_guid
             .clone()
             .unwrap_or(worker_default_guid);
@@ -441,26 +431,26 @@ fn run_download_workers_modern_sdk(
 
                 let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
 
+                let counters: [&AtomicU64; 2] =
+                    [&worker_bytes, &worker_per_server_bytes[server_index]];
                 let maybe_downloaded = tokio::select! {
-                    downloaded = browser_protocol::download(
+                    downloaded = browser_protocol::download_streaming(
                         &worker_client,
                         &worker_server,
-                        &worker_guid,
                         REQUEST_SIZE,
+                        &counters,
                     ) => Some(downloaded),
                     _ = worker_stop.changed() => None,
                 };
 
+                if !signaled_first_transfer && worker_bytes.load(Ordering::Relaxed) > 0 {
+                    let _ = worker_first_transfer_tx.send(true);
+                    signaled_first_transfer = true;
+                }
+
                 match maybe_downloaded {
-                    Some(Ok(downloaded)) => {
+                    Some(Ok(_)) => {
                         worker_successes.fetch_add(1, Ordering::Relaxed);
-                        worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
-                        worker_per_server_bytes[server_index]
-                            .fetch_add(downloaded, Ordering::Relaxed);
-                        if downloaded > 0 && !signaled_first_transfer {
-                            let _ = worker_first_transfer_tx.send(true);
-                            signaled_first_transfer = true;
-                        }
                     }
                     Some(Err(error)) => match error {
                         browser_protocol::TransferRequestError::HttpStatus => {
@@ -478,23 +468,6 @@ fn run_download_workers_modern_sdk(
                 }
             }
         });
-    }
-}
-
-struct ActiveConnectionGuard<'a> {
-    counter: &'a AtomicUsize,
-}
-
-impl<'a> ActiveConnectionGuard<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
-    }
-}
-
-impl Drop for ActiveConnectionGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

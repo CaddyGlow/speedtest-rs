@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::speedtest::browser_protocol::looks_like_host_with_port;
 use crate::speedtest::servers::SpeedtestServer;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,15 +100,6 @@ fn resolve_endpoint(server: &SpeedtestServer) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-fn looks_like_host_with_port(host: &str) -> bool {
-    if host.starts_with('[') && host.contains(":") && host.contains("]:") {
-        return true;
-    }
-    host.rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-        .is_some()
-}
-
 #[allow(dead_code)]
 fn validate_pong_line(line: &str) -> Result<()> {
     let mut fields = line.split_whitespace();
@@ -166,7 +158,8 @@ async fn read_line_with_timeout(stream: &mut TcpStream, action: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_host_with_port, resolve_endpoint, validate_pong_line};
+    use super::{resolve_endpoint, validate_pong_line};
+    use crate::speedtest::browser_protocol::looks_like_host_with_port;
     use crate::speedtest::servers::SpeedtestServer;
 
     #[test]

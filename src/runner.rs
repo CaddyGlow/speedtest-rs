@@ -26,11 +26,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         .command
         .unwrap_or_else(|| Cli::default().command.unwrap())
     {
-        Command::Plan => {
-            let plan = include_str!("../PLAN.md");
-            println!("{}", plan);
-            Ok(())
-        }
         Command::Cache(cache) => run_cache_command(cache.command),
         Command::Run(args) => run_speedtest(args).await,
         Command::Iperf(args) => run_iperf(args).await,
@@ -403,12 +398,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     .await;
 
     let outcome = outcome?;
-
-    let _ = (
-        &outcome.selected_server,
-        &outcome.selected_latency,
-        &outcome.transfer_pool,
-    );
 
     ui.shutdown();
 

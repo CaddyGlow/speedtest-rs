@@ -201,9 +201,6 @@ pub enum Command {
 
     /// Manage local speedtest server cache
     Cache(CacheArgs),
-
-    /// Print implementation plan
-    Plan,
 }
 
 impl Default for Cli {

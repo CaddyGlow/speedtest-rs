@@ -148,6 +148,7 @@ pub struct EngineOutcome {
     pub transfer_pool: Vec<SpeedtestServer>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct RttSummary {
     pub iqm: f64,
@@ -206,18 +207,7 @@ where
         variance_ms: selection.selected.variance_ms,
     });
 
-    let rtt_summary = calculate_rtt(&selection.selected.samples_ms);
     let jitter_ms = calculate_jitter(&selection.selected.samples_ms);
-    if let Some(summary) = &rtt_summary {
-        let _ = (
-            summary.iqm,
-            summary.mean,
-            summary.median,
-            summary.min,
-            summary.max,
-        );
-    }
-    let _ = jitter_ms;
 
     let mut result = RunResult {
         timestamp: current_timestamp()?,
@@ -250,8 +240,11 @@ where
                 .collect::<Vec<_>>(),
         ),
         ping_ms: Some(selection.selected.average_ms),
+        jitter_ms: if jitter_ms > 0.0 { Some(jitter_ms) } else { None },
         download: None,
+        download_latency_ms: None,
         upload: None,
+        upload_latency_ms: None,
         proxy: None,
         sdk_selected_latency_samples_ms: (!selection.selected.samples_ms.is_empty())
             .then(|| selection.selected.samples_ms.clone()),
@@ -284,6 +277,18 @@ where
             }
             EngineStage::Download => {
                 let mut intervals = Vec::new();
+                let latency_server = selection.selected.server.clone();
+                let latency_client = client.clone();
+                let latency_seconds = settings.download_seconds;
+                let latency_task = tokio::spawn(async move {
+                    select::collect_loaded_latency_samples(
+                        &latency_client,
+                        &latency_server,
+                        latency_seconds,
+                    )
+                    .await
+                });
+
                 let stats = download::run_download_test(
                     client,
                     &selection.selected.server,
@@ -312,6 +317,17 @@ where
                     },
                 )
                 .await?;
+
+                let download_latency_samples = latency_task.await.unwrap_or_default();
+                let download_latency_avg = if download_latency_samples.is_empty() {
+                    None
+                } else {
+                    let sum: f64 = download_latency_samples.iter().sum();
+                    Some(sum / download_latency_samples.len() as f64)
+                };
+                result.download_latency_ms = download_latency_avg;
+                result.sdk_download_latency_samples_ms =
+                    (!download_latency_samples.is_empty()).then_some(download_latency_samples);
 
                 push_interval(
                     &mut intervals,
@@ -365,6 +381,18 @@ where
             EngineStage::Upload => {
                 let mut intervals = Vec::new();
                 let mut remote_intervals = Vec::new();
+                let latency_server = selection.selected.server.clone();
+                let latency_client = client.clone();
+                let latency_seconds = settings.upload_seconds;
+                let latency_task = tokio::spawn(async move {
+                    select::collect_loaded_latency_samples(
+                        &latency_client,
+                        &latency_server,
+                        latency_seconds,
+                    )
+                    .await
+                });
+
                 let stats = upload::run_upload_test(
                     client,
                     &selection.selected.server,
@@ -393,6 +421,17 @@ where
                     },
                 )
                 .await?;
+
+                let upload_latency_samples = latency_task.await.unwrap_or_default();
+                let upload_latency_avg = if upload_latency_samples.is_empty() {
+                    None
+                } else {
+                    let sum: f64 = upload_latency_samples.iter().sum();
+                    Some(sum / upload_latency_samples.len() as f64)
+                };
+                result.upload_latency_ms = upload_latency_avg;
+                result.sdk_upload_latency_samples_ms =
+                    (!upload_latency_samples.is_empty()).then_some(upload_latency_samples);
 
                 push_interval(
                     &mut intervals,
@@ -678,6 +717,7 @@ fn current_timestamp() -> Result<String> {
     Ok(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
+#[cfg(test)]
 pub fn calculate_rtt(samples: &[f64]) -> Option<RttSummary> {
     let mut values = samples
         .iter()
@@ -700,8 +740,8 @@ pub fn calculate_rtt(samples: &[f64]) -> Option<RttSummary> {
         if values.len() % 2 == 1 {
             values[middle]
         } else {
-            let left = values[middle];
-            let right = values.get(middle + 1).copied().unwrap_or(left);
+            let left = values[middle - 1];
+            let right = values[middle];
             (left + right) / 2.0
         }
     };
@@ -715,6 +755,7 @@ pub fn calculate_rtt(samples: &[f64]) -> Option<RttSummary> {
     })
 }
 
+#[cfg(test)]
 pub fn calculate_iqm(samples: &[f64]) -> f64 {
     match samples.len() {
         0 => 0.0,
@@ -813,7 +854,7 @@ mod tests {
         assert!((summary.mean - 16.5).abs() < 1e-9);
         assert!((summary.min - 15.0).abs() < 1e-9);
         assert!((summary.max - 18.0).abs() < 1e-9);
-        assert!((summary.median - 17.5).abs() < 1e-9);
+        assert!((summary.median - 16.5).abs() < 1e-9);
     }
 
     #[test]

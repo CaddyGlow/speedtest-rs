@@ -106,8 +106,14 @@ pub struct RunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_pool: Option<Vec<Server>>,
     pub ping_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<f64>,
     pub download: Option<BenchmarkResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_latency_ms: Option<f64>,
     pub upload: Option<BenchmarkResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_latency_ms: Option<f64>,
     pub proxy: Option<String>,
     #[serde(skip)]
     pub sdk_selected_latency_samples_ms: Option<Vec<f64>>,

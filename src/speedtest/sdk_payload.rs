@@ -1585,18 +1585,21 @@ mod tests {
             }),
             server_pool: None,
             ping_ms: Some(2.8),
+            jitter_ms: None,
             download: Some(BenchmarkResult {
                 mbps: 222.162,
                 bytes: 0,
                 duration_seconds: 10,
                 connections: 8,
             }),
+            download_latency_ms: None,
             upload: Some(BenchmarkResult {
                 mbps: 98.95,
                 bytes: 0,
                 duration_seconds: 10,
                 connections: 8,
             }),
+            upload_latency_ms: None,
             proxy: None,
             sdk_selected_latency_samples_ms: Some(vec![2.940037]),
             sdk_download_intervals: Some(vec![ThroughputInterval {

@@ -15,6 +15,7 @@ use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
+use crate::speedtest::transfer_util::{ActiveConnectionGuard, normalize_server_pool};
 use crate::util::{clamp_worker_count, mbps_from_bytes};
 
 const REMOTE_STATS_SAMPLE_INTERVAL_MS: u64 = 250;
@@ -358,17 +359,6 @@ where
     })
 }
 
-fn normalize_server_pool(
-    selected_server: &SpeedtestServer,
-    server_pool: &[SpeedtestServer],
-) -> Vec<SpeedtestServer> {
-    if server_pool.is_empty() {
-        vec![selected_server.clone()]
-    } else {
-        server_pool.to_vec()
-    }
-}
-
 async fn resolve_ready_upload_pool(
     client: &Client,
     mode: TransportProtocol,
@@ -394,19 +384,22 @@ async fn resolve_ready_upload_pool(
                         _ => false,
                     }
                 }
-                TransportProtocol::Xhr => matches!(
-                    timeout(
-                        SERVER_READINESS_TIMEOUT,
-                        browser_protocol::upload(
-                            &probe_client,
-                            &server,
-                            &guid,
-                            vec![0x52_u8; UPLOAD_READINESS_BYTES],
-                        ),
+                TransportProtocol::Xhr => {
+                    let probe_payload = vec![0x52_u8; UPLOAD_READINESS_BYTES];
+                    matches!(
+                        timeout(
+                            SERVER_READINESS_TIMEOUT,
+                            browser_protocol::upload(
+                                &probe_client,
+                                &server,
+                                &guid,
+                                &probe_payload,
+                            ),
+                        )
+                        .await,
+                        Ok(Ok(_))
                     )
-                    .await,
-                    Ok(Ok(_))
-                ),
+                }
             };
 
             (server.id, is_ready)
@@ -577,6 +570,7 @@ fn run_upload_workers_modern_sdk(
                 2 * 1024 * 1024,
                 4 * 1024 * 1024,
             ];
+            let upload_buf = vec![0x42_u8; SIZES[SIZES.len() - 1]];
             let mut cursor = worker % SIZES.len();
             let mut signaled_first_transfer = false;
 
@@ -592,7 +586,7 @@ fn run_upload_workers_modern_sdk(
                         &worker_client,
                         &worker_server,
                         &worker_guid,
-                        vec![0x42_u8; size],
+                        &upload_buf[..size],
                     ) => Some(uploaded),
                     _ = worker_stop.changed() => None,
                 };
@@ -622,23 +616,6 @@ fn run_upload_workers_modern_sdk(
                 }
             }
         });
-    }
-}
-
-struct ActiveConnectionGuard<'a> {
-    counter: &'a AtomicUsize,
-}
-
-impl<'a> ActiveConnectionGuard<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
-    }
-}
-
-impl Drop for ActiveConnectionGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -678,8 +655,7 @@ async fn run_remote_stats_background_upload(
     let payload = vec![0x57_u8; REMOTE_STATS_BACKGROUND_UPLOAD_BYTES];
 
     while !stop_flag.load(Ordering::Relaxed) {
-        if let Ok(uploaded) = browser_protocol::upload(client, server, guid, payload.clone()).await
-        {
+        if let Ok(uploaded) = browser_protocol::upload(client, server, guid, &payload).await {
             total_bytes.fetch_add(uploaded, Ordering::Relaxed);
         }
         sleep(Duration::from_millis(
