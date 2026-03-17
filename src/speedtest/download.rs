@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -95,6 +96,7 @@ where
 
     let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
     let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
+    let first_byte_at = Arc::new(OnceLock::new());
     let target_workers = Arc::new(AtomicUsize::new(worker_count));
     let suggested_size = Arc::new(AtomicUsize::new(config.start_request_size));
 
@@ -116,6 +118,7 @@ where
             &per_server_bytes,
             &target_workers,
             &suggested_size,
+            &first_byte_at,
             &stage_stop_rx,
             &first_transfer_tx,
             &mut tasks,
@@ -132,6 +135,7 @@ where
             &per_server_bytes,
             &target_workers,
             &suggested_size,
+            &first_byte_at,
             &stage_stop_rx,
             &first_transfer_tx,
             &mut tasks,
@@ -145,10 +149,11 @@ where
     let mut last_progress_at: Option<Instant> = None;
     loop {
         if !transfer_started && *first_transfer_rx.borrow() {
-            let now = Instant::now();
-            transfer_started = true;
-            stage_end_at = now + Duration::from_secs(config.max_seconds);
-            progress_clock_start = Some(now);
+            if let Some(started_at) = first_byte_at.get().copied() {
+                transfer_started = true;
+                stage_end_at = started_at + Duration::from_secs(config.max_seconds);
+                progress_clock_start = Some(started_at);
+            }
         }
 
         if Instant::now() >= stage_end_at {
@@ -192,6 +197,7 @@ where
                                     &per_server_bytes,
                                     &target_workers,
                                     &suggested_size,
+                                    &first_byte_at,
                                     &stage_stop_rx,
                                     &first_transfer_tx,
                                     &mut tasks,
@@ -211,6 +217,7 @@ where
                                     &per_server_bytes,
                                     &target_workers,
                                     &suggested_size,
+                                    &first_byte_at,
                                     &stage_stop_rx,
                                     &first_transfer_tx,
                                     &mut tasks,
@@ -359,6 +366,7 @@ fn run_download_workers_modern(
     per_server_bytes: &Arc<Vec<AtomicU64>>,
     target_workers: &Arc<AtomicUsize>,
     suggested_size: &Arc<AtomicUsize>,
+    first_byte_at: &Arc<OnceLock<Instant>>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -380,6 +388,7 @@ fn run_download_workers_modern(
             per_server_bytes,
             target_workers,
             suggested_size,
+            first_byte_at,
             stop_rx,
             first_transfer_tx,
             tasks,
@@ -400,6 +409,7 @@ fn spawn_download_worker_tcp(
     per_server_bytes: &Arc<Vec<AtomicU64>>,
     target_workers: &Arc<AtomicUsize>,
     suggested_size: &Arc<AtomicUsize>,
+    first_byte_at: &Arc<OnceLock<Instant>>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -415,12 +425,12 @@ fn spawn_download_worker_tcp(
     let worker_per_server_bytes = Arc::clone(per_server_bytes);
     let worker_target = Arc::clone(target_workers);
     let worker_suggested_size = Arc::clone(suggested_size);
+    let worker_first_byte_at = Arc::clone(first_byte_at);
     let mut worker_stop = stop_rx.clone();
     let worker_first_transfer_tx = first_transfer_tx.clone();
     tasks.spawn(async move {
         let mut stream = None;
         let mut stream_connected = false;
-        let mut signaled_first_transfer = false;
 
         while !*worker_stop.borrow_and_update() {
             if worker_index >= worker_target.load(Ordering::Relaxed) {
@@ -458,21 +468,21 @@ fn spawn_download_worker_tcp(
             };
 
             let request_size = worker_suggested_size.load(Ordering::Relaxed);
+            let counters: [&AtomicU64; 2] = [&worker_bytes, &worker_per_server_bytes[server_index]];
             let maybe_downloaded = tokio::select! {
-                downloaded = modern_protocol::download(active_stream, request_size) => Some(downloaded),
+                downloaded = modern_protocol::download(
+                    active_stream,
+                    request_size,
+                    &counters,
+                    &worker_first_byte_at,
+                    &worker_first_transfer_tx,
+                ) => Some(downloaded),
                 _ = worker_stop.changed() => None,
             };
 
             match maybe_downloaded {
-                Some(Ok(downloaded)) => {
+                Some(Ok(_)) => {
                     worker_successes.fetch_add(1, Ordering::Relaxed);
-                    worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
-                    worker_per_server_bytes[server_index]
-                        .fetch_add(downloaded, Ordering::Relaxed);
-                    if downloaded > 0 && !signaled_first_transfer {
-                        let _ = worker_first_transfer_tx.send(true);
-                        signaled_first_transfer = true;
-                    }
                 }
                 Some(Err(_)) => {
                     worker_read_errors.fetch_add(1, Ordering::Relaxed);
@@ -512,6 +522,7 @@ fn run_download_workers_modern_sdk(
     per_server_bytes: &Arc<Vec<AtomicU64>>,
     target_workers: &Arc<AtomicUsize>,
     suggested_size: &Arc<AtomicUsize>,
+    first_byte_at: &Arc<OnceLock<Instant>>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -536,6 +547,7 @@ fn run_download_workers_modern_sdk(
             per_server_bytes,
             target_workers,
             suggested_size,
+            first_byte_at,
             stop_rx,
             first_transfer_tx,
             tasks,
@@ -559,6 +571,7 @@ fn spawn_download_worker_xhr(
     per_server_bytes: &Arc<Vec<AtomicU64>>,
     target_workers: &Arc<AtomicUsize>,
     suggested_size: &Arc<AtomicUsize>,
+    first_byte_at: &Arc<OnceLock<Instant>>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -581,11 +594,10 @@ fn spawn_download_worker_xhr(
     let worker_per_server_bytes = Arc::clone(per_server_bytes);
     let worker_target = Arc::clone(target_workers);
     let worker_suggested_size = Arc::clone(suggested_size);
+    let worker_first_byte_at = Arc::clone(first_byte_at);
     let mut worker_stop = stop_rx.clone();
     let worker_first_transfer_tx = first_transfer_tx.clone();
     tasks.spawn(async move {
-        let mut signaled_first_transfer = false;
-
         while !*worker_stop.borrow_and_update() {
             if worker_index >= worker_target.load(Ordering::Relaxed) {
                 break;
@@ -604,14 +616,11 @@ fn spawn_download_worker_xhr(
                     &worker_server,
                     request_size,
                     &counters,
+                    Some(&worker_first_byte_at),
+                    Some(&worker_first_transfer_tx),
                 ) => Some(downloaded),
                 _ = worker_stop.changed() => None,
             };
-
-            if !signaled_first_transfer && worker_bytes.load(Ordering::Relaxed) > 0 {
-                let _ = worker_first_transfer_tx.send(true);
-                signaled_first_transfer = true;
-            }
 
             match maybe_downloaded {
                 Some(Ok(_)) => {

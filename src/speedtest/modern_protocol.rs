@@ -1,9 +1,12 @@
 use std::cmp::min;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use url::Url;
 
@@ -42,11 +45,18 @@ pub async fn ping(stream: &mut TcpStream) -> Result<f64> {
     Ok(start.elapsed().as_secs_f64() * 1_000.0)
 }
 
-pub async fn download(stream: &mut TcpStream, bytes: usize) -> Result<u64> {
+pub async fn download(
+    stream: &mut TcpStream,
+    bytes: usize,
+    live_counters: &[&AtomicU64],
+    first_byte_at: &OnceLock<Instant>,
+    first_transfer_tx: &watch::Sender<bool>,
+) -> Result<u64> {
     let command = format!("DOWNLOAD {bytes}\n");
     write_all_with_timeout(stream, command.as_bytes(), "DOWNLOAD command").await?;
 
     let mut remaining = bytes;
+    let mut total = 0_u64;
     let mut buffer = [0_u8; IO_BUFFER_BYTES];
     while remaining > 0 {
         let read_limit = min(remaining, buffer.len());
@@ -54,10 +64,18 @@ pub async fn download(stream: &mut TcpStream, bytes: usize) -> Result<u64> {
         if read == 0 {
             bail!("modern DOWNLOAD stream closed before receiving all requested bytes");
         }
-        remaining -= read;
+        if first_byte_at.set(Instant::now()).is_ok() {
+            let _ = first_transfer_tx.send(true);
+        }
+        let read = read as u64;
+        total += read;
+        for counter in live_counters {
+            counter.fetch_add(read, Ordering::Relaxed);
+        }
+        remaining -= read as usize;
     }
 
-    Ok(bytes as u64)
+    Ok(total)
 }
 
 pub async fn upload(stream: &mut TcpStream, total_size: usize) -> Result<u64> {

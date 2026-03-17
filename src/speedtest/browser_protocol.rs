@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -571,7 +573,7 @@ pub async fn download(
     _guid: &str,
     size: usize,
 ) -> std::result::Result<u64, TransferRequestError> {
-    download_streaming(client, server, size, &[]).await
+    download_streaming(client, server, size, &[], None, None).await
 }
 
 pub async fn download_streaming(
@@ -579,6 +581,8 @@ pub async fn download_streaming(
     server: &SpeedtestServer,
     size: usize,
     live_counters: &[&AtomicU64],
+    first_byte_at: Option<&OnceLock<Instant>>,
+    first_transfer_tx: Option<&watch::Sender<bool>>,
 ) -> std::result::Result<u64, TransferRequestError> {
     let mut last_error = None;
 
@@ -625,6 +629,12 @@ pub async fn download_streaming(
             match chunk {
                 Ok(bytes) => {
                     let len = bytes.len() as u64;
+                    if let Some(first_byte_at) = first_byte_at
+                        && first_byte_at.set(Instant::now()).is_ok()
+                        && let Some(first_transfer_tx) = first_transfer_tx
+                    {
+                        let _ = first_transfer_tx.send(true);
+                    }
                     total += len;
                     for counter in live_counters {
                         counter.fetch_add(len, Ordering::Relaxed);
