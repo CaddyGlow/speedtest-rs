@@ -13,6 +13,7 @@ pub struct SpeedProgressSample {
     pub elapsed: Duration,
     pub mbps: f64,
     pub bytes: u64,
+    pub rtt_ms: Option<f64>,
 }
 
 pub struct Ui {

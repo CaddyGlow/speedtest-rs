@@ -28,6 +28,7 @@ pub struct SpeedProgressBar {
     sparkline: RefCell<Sparkline>,
     last_sparkline_index: Cell<Option<usize>>,
     last_non_zero_mbps: Cell<f64>,
+    last_rtt_ms: Cell<Option<f64>>,
 }
 
 impl CompactUi {
@@ -108,6 +109,7 @@ impl CompactUi {
             sparkline: RefCell::new(Sparkline::new(sparkline_width)),
             last_sparkline_index: Cell::new(None),
             last_non_zero_mbps: Cell::new(0.0),
+            last_rtt_ms: Cell::new(None),
         }
     }
 
@@ -126,10 +128,18 @@ impl CompactUi {
             progress.last_non_zero_mbps.set(mbps);
             mbps
         };
+        if let Some(rtt) = sample.rtt_ms.filter(|rtt| rtt.is_finite() && *rtt >= 0.0) {
+            progress.last_rtt_ms.set(Some(rtt));
+        }
         progress.bar.set_prefix(format!(
-            "{:7.2} Mbps {:.1} MB",
+            "{:7.2} Mbps {:.1} MB{}",
             mbps,
             sample.bytes as f64 / 1_000_000.0,
+            progress
+                .last_rtt_ms
+                .get()
+                .map(|rtt| format!(" RTT {rtt:.2} ms"))
+                .unwrap_or_default(),
         ));
 
         let sparkline_index = progress.sample_index(sample.elapsed);
@@ -150,9 +160,14 @@ impl CompactUi {
         progress.bar.set_position(progress.total_seconds);
         progress.bar.set_prefix(String::new());
         progress.bar.finish_with_message(format!(
-            "{} done {mbps:.2} Mbps ({:.1} MB)",
+            "{} done {mbps:.2} Mbps ({:.1} MB){}",
             progress.phase,
-            bytes as f64 / 1_000_000.0
+            bytes as f64 / 1_000_000.0,
+            progress
+                .last_rtt_ms
+                .get()
+                .map(|rtt| format!(" RTT {rtt:.2} ms"))
+                .unwrap_or_default(),
         ));
         progress
             .sparkline_bar

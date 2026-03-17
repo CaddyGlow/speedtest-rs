@@ -106,9 +106,10 @@ pub async fn probe_latency_samples_websocket(
     Err(error).with_context(|| format!("websocket latency probe failed at {endpoint}"))
 }
 
-pub async fn probe_latency_samples_websocket_for_duration(
+pub async fn probe_latency_samples_websocket_for_duration_with_sender(
     server: &SpeedtestServer,
     duration: Duration,
+    sender: Option<UnboundedSender<f64>>,
 ) -> Result<Vec<f64>> {
     let target_duration = duration.max(Duration::from_secs(1));
     debug!(
@@ -123,8 +124,12 @@ pub async fn probe_latency_samples_websocket_for_duration(
 
     for endpoint in endpoints {
         debug!(server_id = server.id, endpoint = %endpoint, "trying websocket endpoint");
-        match probe_latency_samples_over_websocket_endpoint_for_duration(&endpoint, target_duration)
-            .await
+        match probe_latency_samples_over_websocket_endpoint_for_duration(
+            &endpoint,
+            target_duration,
+            sender.clone(),
+        )
+        .await
         {
             Ok(latencies) => {
                 debug!(
@@ -304,6 +309,7 @@ async fn probe_latency_samples_over_websocket_endpoint(
 async fn probe_latency_samples_over_websocket_endpoint_for_duration(
     endpoint: &Url,
     duration: Duration,
+    sender: Option<UnboundedSender<f64>>,
 ) -> Result<Vec<f64>> {
     let mut request = endpoint
         .as_str()
@@ -355,6 +361,9 @@ async fn probe_latency_samples_over_websocket_endpoint_for_duration(
         }
 
         successful_samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+        if let Some(sender) = sender.as_ref() {
+            let _ = sender.send(*successful_samples.last().unwrap_or(&0.0));
+        }
         trace!(
             endpoint = %endpoint,
             sample_index,

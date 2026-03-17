@@ -8,6 +8,7 @@ use chrono::{SecondsFormat, Utc};
 use md5::compute as md5_compute;
 use reqwest::Client;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::model::{
     BenchmarkResult, ClientMeta, DirectionDetails, MstBucketOut, MstSpeedsOut, RunDetails,
@@ -58,6 +59,7 @@ pub enum EngineEvent {
         mbps: f64,
         bytes: u64,
         active_connections: usize,
+        rtt_ms: Option<f64>,
     },
     StageResult {
         stage: EngineStage,
@@ -281,11 +283,15 @@ where
                 let latency_server = selection.selected.server.clone();
                 let latency_client = client.clone();
                 let latency_seconds = settings.download_seconds;
+                let (download_rtt_tx, download_rtt_rx) = watch::channel(None);
                 let latency_task = tokio::spawn(async move {
-                    select::collect_loaded_latency_samples(
+                    select::collect_loaded_latency_samples_with_progress(
                         &latency_client,
                         &latency_server,
                         latency_seconds,
+                        |iqm| {
+                            let _ = download_rtt_tx.send(Some(iqm));
+                        },
                     )
                     .await
                 });
@@ -313,6 +319,7 @@ where
                             mbps: snapshot.mbps,
                             bytes: snapshot.bytes,
                             active_connections: snapshot.active_connections,
+                            rtt_ms: *download_rtt_rx.borrow(),
                         });
                         push_interval(
                             &mut intervals,
@@ -417,11 +424,15 @@ where
                 let latency_server = selection.selected.server.clone();
                 let latency_client = client.clone();
                 let latency_seconds = settings.upload_seconds;
+                let (upload_rtt_tx, upload_rtt_rx) = watch::channel(None);
                 let latency_task = tokio::spawn(async move {
-                    select::collect_loaded_latency_samples(
+                    select::collect_loaded_latency_samples_with_progress(
                         &latency_client,
                         &latency_server,
                         latency_seconds,
+                        |iqm| {
+                            let _ = upload_rtt_tx.send(Some(iqm));
+                        },
                     )
                     .await
                 });
@@ -449,6 +460,7 @@ where
                             mbps: snapshot.mbps,
                             bytes: snapshot.bytes,
                             active_connections: snapshot.active_connections,
+                            rtt_ms: *upload_rtt_rx.borrow(),
                         });
                         push_interval(
                             &mut intervals,

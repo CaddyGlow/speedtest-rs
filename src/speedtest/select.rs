@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
@@ -131,13 +132,35 @@ pub async fn probe_server_latency(
     probe_server_latency_detailed(client, server, samples).await
 }
 
-pub async fn collect_loaded_latency_samples(
+pub async fn collect_loaded_latency_samples_with_progress<F>(
     client: &Client,
     server: &SpeedtestServer,
     stage_seconds: u64,
-) -> Vec<f64> {
+    mut on_progress: F,
+) -> Vec<f64>
+where
+    F: FnMut(f64),
+{
     let duration = Duration::from_secs(stage_seconds.max(1));
-    let mut samples = collect_latency_modern_ws_for_duration(server, duration).await;
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let worker_server = server.clone();
+    let worker = tokio::spawn(async move {
+        collect_latency_modern_ws_for_duration(&worker_server, duration, Some(sender)).await
+    });
+
+    let mut observed_samples = Vec::new();
+    let mut last_emit = Instant::now() - Duration::from_millis(50);
+    while let Some(sample) = receiver.recv().await {
+        observed_samples.push(sample);
+        maybe_emit_loaded_latency_iqm(
+            &observed_samples,
+            stage_seconds,
+            &mut last_emit,
+            &mut on_progress,
+        );
+    }
+
+    let mut samples = worker.await.unwrap_or_default();
     if samples.is_empty() {
         let guid = server.session_guid.as_deref().unwrap_or("tunmux-speedtest");
         let fallback_samples = (duration.as_millis() / 100).max(10) as usize;
@@ -145,6 +168,13 @@ pub async fn collect_loaded_latency_samples(
             browser_protocol::probe_latency_samples_http(client, server, guid, fallback_samples)
                 .await
         {
+            observed_samples.extend(fallback.iter().copied());
+            maybe_emit_loaded_latency_iqm(
+                &observed_samples,
+                stage_seconds,
+                &mut last_emit,
+                &mut on_progress,
+            );
             samples.append(&mut fallback);
         }
     }
@@ -164,13 +194,19 @@ pub async fn collect_loaded_latency_samples(
 async fn collect_latency_modern_ws_for_duration(
     server: &SpeedtestServer,
     duration: Duration,
+    sender: Option<mpsc::UnboundedSender<f64>>,
 ) -> Vec<f64> {
     let mut tasks = JoinSet::new();
     for _ in 0..LOADED_LATENCY_WORKERS {
         let worker_server = server.clone();
+        let sender = sender.clone();
         tasks.spawn(async move {
-            browser_protocol::probe_latency_samples_websocket_for_duration(&worker_server, duration)
-                .await
+            browser_protocol::probe_latency_samples_websocket_for_duration_with_sender(
+                &worker_server,
+                duration,
+                sender,
+            )
+            .await
         });
     }
 
@@ -198,6 +234,66 @@ async fn collect_latency_modern_ws_for_duration(
     }
 
     samples
+}
+
+fn maybe_emit_loaded_latency_iqm<F>(
+    samples: &[f64],
+    stage_seconds: u64,
+    last_emit: &mut Instant,
+    on_progress: &mut F,
+) where
+    F: FnMut(f64),
+{
+    if last_emit.elapsed() < Duration::from_millis(50) {
+        return;
+    }
+
+    let normalized = normalize_loaded_latency_samples(samples.to_vec(), stage_seconds);
+    let Some(iqm) = calculate_iqm(&normalized) else {
+        return;
+    };
+
+    *last_emit = Instant::now();
+    on_progress(iqm);
+}
+
+fn calculate_iqm(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut values = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.is_finite() && *sample >= 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    Some(match values.len() {
+        1 => values[0],
+        2 => (values[0] + values[1]) / 2.0,
+        len => {
+            let lower = len as f64 / 4.0;
+            let upper = 3.0 * len as f64 / 4.0;
+            let start = lower.ceil() as usize;
+            let end = upper.floor() as usize;
+            let fraction = upper - upper.floor();
+            let core_sum = if start < end {
+                values[start..end].iter().sum::<f64>()
+            } else {
+                0.0
+            };
+            let edge_sum = if start > 0 && end < len {
+                values[start - 1] + values[end]
+            } else {
+                0.0
+            };
+            (fraction * edge_sum + core_sum) / (len as f64 / 2.0)
+        }
+    })
 }
 
 fn normalize_loaded_latency_samples(mut samples: Vec<f64>, stage_seconds: u64) -> Vec<f64> {

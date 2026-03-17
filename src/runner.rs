@@ -339,12 +339,14 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
                     mbps,
                     bytes,
                     active_connections,
+                    rtt_ms,
                 } => {
                     let _ = active_connections;
                     let sample = ui::SpeedProgressSample {
                         elapsed,
                         mbps,
                         bytes,
+                        rtt_ms,
                     };
                     match stage {
                         engine::EngineStage::Download => {
@@ -538,6 +540,7 @@ async fn run_iperf(args: IperfArgs) -> Result<()> {
                             elapsed: snapshot.elapsed,
                             mbps: snapshot.mbps,
                             bytes: snapshot.bytes,
+                            rtt_ms: None,
                         },
                     );
                 }
