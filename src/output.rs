@@ -127,19 +127,15 @@ pub fn print_human(result: &RunResult) {
                 )
             })
             .unwrap_or_default();
-        let duration_str = format_stage_duration(
-            download.duration_seconds,
-            download.actual_duration_seconds,
-        );
         println!(
-            "  {} {}  {} in {} ({} workers){}",
+            "  {} {}  {} in {}s ({} workers){}",
             theme.badge("DOWN", throughput_color(download.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", download.mbps),
                 throughput_color(download.mbps)
             ),
             format_bytes(download.bytes),
-            duration_str,
+            download.duration_seconds,
             download.connections,
             latency_suffix
         );
@@ -154,19 +150,15 @@ pub fn print_human(result: &RunResult) {
                 )
             })
             .unwrap_or_default();
-        let duration_str = format_stage_duration(
-            upload.duration_seconds,
-            upload.actual_duration_seconds,
-        );
         println!(
-            "  {} {}  {} in {} ({} workers){}",
+            "  {} {}  {} in {}s ({} workers){}",
             theme.badge("UP", throughput_color(upload.mbps)),
             theme.paint(
                 &format!("{:.2} Mbps", upload.mbps),
                 throughput_color(upload.mbps)
             ),
             format_bytes(upload.bytes),
-            duration_str,
+            upload.duration_seconds,
             upload.connections,
             latency_suffix
         );
@@ -299,15 +291,6 @@ impl Theme {
     fn badge(&self, text: &str, color: &str) -> String {
         self.paint(&format!("[{text}]"), color)
     }
-}
-
-fn format_stage_duration(configured: u64, actual: Option<f64>) -> String {
-    if let Some(actual) = actual {
-        if actual > 0.0 && actual < (configured as f64 - 0.5) {
-            return format!("{actual:.1}s");
-        }
-    }
-    format!("{configured}s")
 }
 
 fn format_bytes(bytes: u64) -> String {
