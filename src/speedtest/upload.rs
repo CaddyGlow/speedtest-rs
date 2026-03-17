@@ -17,8 +17,9 @@ use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{
-    ActiveConnectionGuard, drain_join_set, elapsed_ms_since, normalize_server_pool,
-    resolve_ready_server_pool,
+    ActiveConnectionGuard, TransferLoopState, TransferSample, drain_join_set, elapsed_ms_since,
+    new_transfer_control, normalize_server_pool, resolve_ready_server_pool, run_transfer_loop,
+    spawn_worker_range,
 };
 use crate::util::clamp_worker_count;
 
@@ -90,16 +91,18 @@ where
         .any(|server| server.id == selected_server.id);
 
     let start_at = Instant::now();
-    let mut stage_end_at = start_at + Duration::from_secs(config.max_seconds);
+    let stage_end_at = start_at + Duration::from_secs(config.max_seconds);
     let mut upload_stats_task = None;
     let mut remote_stats_background_task = None;
     let mut remote_stats_background_stop = None;
     let mut upload_stats_rx = None;
     let mut latest_remote_sample = None;
     let mut remote_samples = Vec::new();
-    let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
-    let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
-    let first_byte_at = Arc::new(OnceLock::new());
+    let control = new_transfer_control(worker_count, config.start_request_size);
+    let stage_stop_rx = control.stage_stop_rx.clone();
+    let first_transfer_tx = control.first_transfer_tx.clone();
+    let mut first_transfer_rx = control.first_transfer_rx.clone();
+    let first_byte_at = Arc::clone(&control.first_byte_at);
 
     if matches!(mode, TransportProtocol::Xhr)
         && selected_server_ready
@@ -151,182 +154,149 @@ where
         upload_stats_rx = Some(rx);
     }
 
-    let target_workers = Arc::new(AtomicUsize::new(worker_count));
-    let suggested_size = Arc::new(AtomicUsize::new(config.start_request_size));
+    let target_workers = Arc::clone(&control.target_workers);
+    let suggested_size = Arc::clone(&control.suggested_size);
 
     let mut tasks = JoinSet::new();
-    let mut spawned_count = worker_count;
-    match mode {
-        TransportProtocol::Xhr => {
-            run_upload_workers_modern_sdk(
-                client,
-                &ready_pool,
-                &default_guid,
-                worker_count,
-                &total_bytes,
-                &request_attempts,
-                &request_successes,
-                &request_http_errors,
-                &request_transport_errors,
-                &response_read_errors,
-                &active_connections,
-                &target_workers,
-                &suggested_size,
-                &first_byte_at,
-                &stage_stop_rx,
-                &first_transfer_tx,
-                &mut tasks,
-            );
-        }
-        TransportProtocol::Tcp => {
-            run_upload_workers_modern(
-                &ready_pool,
-                worker_count,
-                &total_bytes,
-                &request_attempts,
-                &request_successes,
-                &request_transport_errors,
-                &response_read_errors,
-                &active_connections,
-                &target_workers,
-                &suggested_size,
-                &first_byte_at,
-                &stage_stop_rx,
-                &first_transfer_tx,
-                &mut tasks,
-            );
-        }
-    }
+    let mut loop_state = TransferLoopState {
+        stage_end_at,
+        progress_clock_start: None,
+        transfer_started: false,
+        last_progress_at: None,
+        spawned_count: worker_count,
+    };
+    spawn_worker_range(0..worker_count, &mut tasks, |idx, tasks| match mode {
+        TransportProtocol::Tcp => spawn_upload_worker_tcp(
+            idx,
+            &ready_pool,
+            &total_bytes,
+            &request_attempts,
+            &request_successes,
+            &request_transport_errors,
+            &response_read_errors,
+            &active_connections,
+            &target_workers,
+            &suggested_size,
+            &first_byte_at,
+            &stage_stop_rx,
+            &first_transfer_tx,
+            tasks,
+        ),
+        TransportProtocol::Xhr => spawn_upload_worker_xhr(
+            idx,
+            client,
+            &ready_pool,
+            &default_guid,
+            &total_bytes,
+            &request_attempts,
+            &request_successes,
+            &request_http_errors,
+            &request_transport_errors,
+            &response_read_errors,
+            &active_connections,
+            &target_workers,
+            &suggested_size,
+            &first_byte_at,
+            &stage_stop_rx,
+            &first_transfer_tx,
+            tasks,
+        ),
+    });
 
-    let poll_interval = STAGE_POLL_INTERVAL;
     let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
-    let mut progress_clock_start = None;
-    let mut transfer_started = false;
-    let mut last_progress_at: Option<Instant> = None;
-
-    loop {
-        if !transfer_started && *first_transfer_rx.borrow() {
-            if let Some(started_at) = first_byte_at.get().copied() {
-                transfer_started = true;
-                stage_end_at = started_at + Duration::from_secs(config.max_seconds);
-                progress_clock_start = Some(started_at);
-            }
-        }
-
-        if Instant::now() >= stage_end_at {
-            let _ = stage_stop_tx.send(true);
-            break;
-        }
-
-        tokio::select! {
-            joined = tasks.join_next() => {
-                if joined.is_none() {
-                    break;
+    run_transfer_loop(
+        &mut tasks,
+        &mut first_transfer_rx,
+        &control,
+        &mut loop_state,
+        STAGE_POLL_INTERVAL,
+        config,
+        &active_connections,
+        &mut calc,
+        |_, elapsed| {
+            if let Some(rx) = upload_stats_rx.as_mut() {
+                while let Ok(sample) = rx.try_recv() {
+                    latest_remote_sample = Some(sample);
+                    remote_samples.push(sample);
                 }
             }
-            changed = first_transfer_rx.changed() => {
-                if changed.is_err() {
-                    continue;
-                }
+
+            let local_bytes = total_bytes.load(Ordering::Relaxed);
+            let remote_progress = latest_remote_sample.and_then(|sample| {
+                remote_sample_rate(sample, elapsed).map(|(bytes, mbps)| (sample, bytes, mbps))
+            });
+
+            let (sample_elapsed_ms, sample_bytes) = if let Some((sample, bytes, _)) = remote_progress {
+                (sample.elapsed_ms, bytes)
+            } else {
+                (elapsed.as_millis() as u64, local_bytes)
+            };
+
+            let (progress_bytes, progress_mbps) = if let Some((_, bytes, mbps)) = remote_progress {
+                (bytes, Some(mbps))
+            } else {
+                (sample_bytes, None)
+            };
+
+            TransferSample {
+                sample_elapsed_ms,
+                sample_bytes,
+                progress_bytes,
+                progress_mbps,
             }
-            _ = sleep(poll_interval) => {
-                if let Some(clock_start) = progress_clock_start {
-                    if let Some(rx) = upload_stats_rx.as_mut() {
-                        while let Ok(sample) = rx.try_recv() {
-                            latest_remote_sample = Some(sample);
-                            remote_samples.push(sample);
-                        }
-                    }
-
-                    let now = Instant::now();
-                    let local_bytes = total_bytes.load(Ordering::Relaxed);
-                    let elapsed = now.saturating_duration_since(clock_start);
-                    let remote_progress = latest_remote_sample.and_then(|sample| {
-                        remote_sample_rate(sample, elapsed).map(|(bytes, mbps)| (sample, bytes, mbps))
-                    });
-
-                    let (sample_elapsed_ms, sample_bytes) = if let Some((sample, bytes, _)) = remote_progress {
-                        (sample.elapsed_ms, bytes)
-                    } else {
-                        (elapsed.as_millis() as u64, local_bytes)
-                    };
-                    let blended_bps = calc.record_sample(sample_elapsed_ms, sample_bytes);
-
-                    let elapsed_ms = elapsed.as_millis() as u64;
-                    let desired = calc.desired_connections(config.connections);
-                    target_workers.store(desired, Ordering::Relaxed);
-                    if desired > spawned_count && !ready_pool.is_empty() {
-                        for idx in spawned_count..desired {
-                            match mode {
-                                TransportProtocol::Tcp => spawn_upload_worker_tcp(
-                                    idx,
-                                    &ready_pool,
-                                    &total_bytes,
-                                    &request_attempts,
-                                    &request_successes,
-                                    &request_transport_errors,
-                                    &response_read_errors,
-                                    &active_connections,
-                                    &target_workers,
-                                    &suggested_size,
-                                    &first_byte_at,
-                                    &stage_stop_rx,
-                                    &first_transfer_tx,
-                                    &mut tasks,
-                                ),
-                                TransportProtocol::Xhr => spawn_upload_worker_xhr(
-                                    idx,
-                                    client,
-                                    &ready_pool,
-                                    &default_guid,
-                                    &total_bytes,
-                                    &request_attempts,
-                                    &request_successes,
-                                    &request_http_errors,
-                                    &request_transport_errors,
-                                    &response_read_errors,
-                                    &active_connections,
-                                    &target_workers,
-                                    &suggested_size,
-                                    &first_byte_at,
-                                    &stage_stop_rx,
-                                    &first_transfer_tx,
-                                    &mut tasks,
-                                ),
-                            }
-                        }
-                        spawned_count = desired;
-                    }
-
-                    let time_remaining_ms =
-                        (config.max_seconds * 1000).saturating_sub(elapsed_ms);
-                    let conns = active_connections.load(Ordering::Relaxed).max(1);
-                    let size = calc.suggested_request_size(conns, time_remaining_ms, config);
-                    suggested_size.store(size, Ordering::Relaxed);
-
-                    if let Some(interval) = config.progress_interval {
-                        let should_report = last_progress_at
-                            .map_or(true, |t| now.duration_since(t) >= interval);
-                        if should_report {
-                            last_progress_at = Some(now);
-                            let (progress_bytes, progress_mbps) =
-                                if let Some((_, bytes, mbps)) = remote_progress {
-                                    (bytes, mbps)
-                                } else {
-                                    (sample_bytes, blended_bps * 8.0 / 1_000_000.0)
-                                };
-                            on_progress(UploadProgress {
-                                elapsed,
-                                bytes: progress_bytes,
-                                mbps: progress_mbps,
-                                active_connections: active_connections.load(Ordering::Relaxed),
-                            });
-                        }
-                    }
-                }
+        },
+        |range, tasks| {
+            if ready_pool.is_empty() {
+                return;
             }
-        }
-    }
+            spawn_worker_range(range, tasks, |idx, tasks| match mode {
+                TransportProtocol::Tcp => spawn_upload_worker_tcp(
+                    idx,
+                    &ready_pool,
+                    &total_bytes,
+                    &request_attempts,
+                    &request_successes,
+                    &request_transport_errors,
+                    &response_read_errors,
+                    &active_connections,
+                    &target_workers,
+                    &suggested_size,
+                    &first_byte_at,
+                    &stage_stop_rx,
+                    &first_transfer_tx,
+                    tasks,
+                ),
+                TransportProtocol::Xhr => spawn_upload_worker_xhr(
+                    idx,
+                    client,
+                    &ready_pool,
+                    &default_guid,
+                    &total_bytes,
+                    &request_attempts,
+                    &request_successes,
+                    &request_http_errors,
+                    &request_transport_errors,
+                    &response_read_errors,
+                    &active_connections,
+                    &target_workers,
+                    &suggested_size,
+                    &first_byte_at,
+                    &stage_stop_rx,
+                    &first_transfer_tx,
+                    tasks,
+                ),
+            });
+        },
+        |elapsed, bytes, mbps, active_connections| {
+            on_progress(UploadProgress {
+                elapsed,
+                bytes,
+                mbps,
+                active_connections,
+            });
+        },
+    )
+    .await;
 
     drain_join_set(&mut tasks, STAGE_JOIN_GRACE_PERIOD).await;
 
@@ -391,7 +361,7 @@ where
     }
 
     let throughput_result = calc.finish();
-    let actual_duration_ms = elapsed_ms_since(progress_clock_start);
+    let actual_duration_ms = elapsed_ms_since(loop_state.progress_clock_start);
 
     let min_remote_elapsed_ms = config.max_seconds.saturating_mul(800);
     let remote_final_sample = remote_samples
@@ -479,47 +449,6 @@ async fn resolve_ready_upload_pool(
         }
     })
     .await
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_upload_workers_modern(
-    server_pool: &[SpeedtestServer],
-    worker_count: usize,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
-    tasks: &mut JoinSet<()>,
-) {
-    if server_pool.is_empty() {
-        return;
-    }
-
-    for worker in 0..worker_count {
-        spawn_upload_worker_tcp(
-            worker,
-            server_pool,
-            total_bytes,
-            request_attempts,
-            request_successes,
-            request_transport_errors,
-            response_read_errors,
-            active_connections,
-            target_workers,
-            suggested_size,
-            first_byte_at,
-            stop_rx,
-            first_transfer_tx,
-            tasks,
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -628,53 +557,6 @@ fn spawn_upload_worker_tcp(
             worker_active_connections.fetch_sub(1, Ordering::Relaxed);
         }
     });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_upload_workers_modern_sdk(
-    client: &Client,
-    server_pool: &[SpeedtestServer],
-    default_guid: &str,
-    worker_count: usize,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_http_errors: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
-    tasks: &mut JoinSet<()>,
-) {
-    if server_pool.is_empty() {
-        return;
-    }
-
-    for worker in 0..worker_count {
-        spawn_upload_worker_xhr(
-            worker,
-            client,
-            server_pool,
-            default_guid,
-            total_bytes,
-            request_attempts,
-            request_successes,
-            request_http_errors,
-            request_transport_errors,
-            response_read_errors,
-            active_connections,
-            target_workers,
-            suggested_size,
-            first_byte_at,
-            stop_rx,
-            first_transfer_tx,
-            tasks,
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

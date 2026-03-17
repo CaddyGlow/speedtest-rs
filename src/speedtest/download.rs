@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
@@ -15,8 +15,9 @@ use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{
-    ActiveConnectionGuard, drain_join_set, elapsed_ms_since, normalize_server_pool,
-    resolve_ready_server_pool,
+    ActiveConnectionGuard, TransferLoopState, TransferSample, drain_join_set, elapsed_ms_since,
+    new_transfer_control, normalize_server_pool, resolve_ready_server_pool, run_transfer_loop,
+    spawn_worker_range,
 };
 use crate::util::{clamp_worker_count, mbps_from_bytes};
 
@@ -88,7 +89,7 @@ where
     }
 
     let start_at = Instant::now();
-    let mut stage_end_at = start_at + Duration::from_secs(config.max_seconds);
+    let stage_end_at = start_at + Duration::from_secs(config.max_seconds);
     let per_server_bytes = Arc::new(
         ready_pool
             .iter()
@@ -96,20 +97,45 @@ where
             .collect::<Vec<_>>(),
     );
 
-    let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
-    let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
-    let first_byte_at = Arc::new(OnceLock::new());
-    let target_workers = Arc::new(AtomicUsize::new(worker_count));
-    let suggested_size = Arc::new(AtomicUsize::new(config.start_request_size));
+    let control = new_transfer_control(worker_count, config.start_request_size);
+    let stage_stop_rx = control.stage_stop_rx.clone();
+    let first_transfer_tx = control.first_transfer_tx.clone();
+    let mut first_transfer_rx = control.first_transfer_rx.clone();
+    let first_byte_at = Arc::clone(&control.first_byte_at);
+    let target_workers = Arc::clone(&control.target_workers);
+    let suggested_size = Arc::clone(&control.suggested_size);
 
     let mut tasks = JoinSet::new();
-    let mut spawned_count = worker_count;
-    match mode {
-        TransportProtocol::Xhr => run_download_workers_modern_sdk(
+    let mut loop_state = TransferLoopState {
+        stage_end_at,
+        progress_clock_start: None,
+        transfer_started: false,
+        last_progress_at: None,
+        spawned_count: worker_count,
+    };
+    spawn_worker_range(0..worker_count, &mut tasks, |idx, tasks| match mode {
+        TransportProtocol::Tcp => spawn_download_worker_tcp(
+            idx,
+            &ready_pool,
+            &total_bytes,
+            &request_attempts,
+            &request_successes,
+            &request_transport_errors,
+            &response_read_errors,
+            &active_connections,
+            &per_server_bytes,
+            &target_workers,
+            &suggested_size,
+            &first_byte_at,
+            &stage_stop_rx,
+            &first_transfer_tx,
+            tasks,
+        ),
+        TransportProtocol::Xhr => spawn_download_worker_xhr(
+            idx,
             client,
             &ready_pool,
             &default_guid,
-            worker_count,
             &total_bytes,
             &request_attempts,
             &request_successes,
@@ -123,140 +149,89 @@ where
             &first_byte_at,
             &stage_stop_rx,
             &first_transfer_tx,
-            &mut tasks,
+            tasks,
         ),
-        TransportProtocol::Tcp => run_download_workers_modern(
-            &ready_pool,
-            worker_count,
-            &total_bytes,
-            &request_attempts,
-            &request_successes,
-            &request_transport_errors,
-            &response_read_errors,
-            &active_connections,
-            &per_server_bytes,
-            &target_workers,
-            &suggested_size,
-            &first_byte_at,
-            &stage_stop_rx,
-            &first_transfer_tx,
-            &mut tasks,
-        ),
-    }
+    });
 
-    let poll_interval = STAGE_POLL_INTERVAL;
     let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
-    let mut progress_clock_start = None;
-    let mut transfer_started = false;
-    let mut last_progress_at: Option<Instant> = None;
-    loop {
-        if !transfer_started && *first_transfer_rx.borrow() {
-            if let Some(started_at) = first_byte_at.get().copied() {
-                transfer_started = true;
-                stage_end_at = started_at + Duration::from_secs(config.max_seconds);
-                progress_clock_start = Some(started_at);
+    run_transfer_loop(
+        &mut tasks,
+        &mut first_transfer_rx,
+        &control,
+        &mut loop_state,
+        STAGE_POLL_INTERVAL,
+        config,
+        &active_connections,
+        &mut calc,
+        |now, elapsed| {
+            let bytes = total_bytes.load(Ordering::Relaxed);
+            let _ = now;
+            TransferSample {
+                sample_elapsed_ms: elapsed.as_millis() as u64,
+                sample_bytes: bytes,
+                progress_bytes: bytes,
+                progress_mbps: None,
             }
-        }
-
-        if Instant::now() >= stage_end_at {
-            let _ = stage_stop_tx.send(true);
-            break;
-        }
-
-        tokio::select! {
-            joined = tasks.join_next() => {
-                if joined.is_none() {
-                    break;
-                }
+        },
+        |range, tasks| {
+            if ready_pool.is_empty() {
+                return;
             }
-            changed = first_transfer_rx.changed() => {
-                if changed.is_err() {
-                    continue;
-                }
-            }
-            _ = sleep(poll_interval) => {
-                if let Some(clock_start) = progress_clock_start {
-                    let now = Instant::now();
-                    let bytes = total_bytes.load(Ordering::Relaxed);
-                    let elapsed = now.saturating_duration_since(clock_start);
-                    let blended_bps = calc.record_sample(elapsed.as_millis() as u64, bytes);
-
-                    let elapsed_ms = elapsed.as_millis() as u64;
-                    let desired = calc.desired_connections(config.connections);
-                    target_workers.store(desired, Ordering::Relaxed);
-                    if desired > spawned_count && !ready_pool.is_empty() {
-                        for idx in spawned_count..desired {
-                            match mode {
-                                TransportProtocol::Tcp => spawn_download_worker_tcp(
-                                    idx,
-                                    &ready_pool,
-                                    &total_bytes,
-                                    &request_attempts,
-                                    &request_successes,
-                                    &request_transport_errors,
-                                    &response_read_errors,
-                                    &active_connections,
-                                    &per_server_bytes,
-                                    &target_workers,
-                                    &suggested_size,
-                                    &first_byte_at,
-                                    &stage_stop_rx,
-                                    &first_transfer_tx,
-                                    &mut tasks,
-                                ),
-                                TransportProtocol::Xhr => spawn_download_worker_xhr(
-                                    idx,
-                                    client,
-                                    &ready_pool,
-                                    &default_guid,
-                                    &total_bytes,
-                                    &request_attempts,
-                                    &request_successes,
-                                    &request_http_errors,
-                                    &request_transport_errors,
-                                    &response_read_errors,
-                                    &active_connections,
-                                    &per_server_bytes,
-                                    &target_workers,
-                                    &suggested_size,
-                                    &first_byte_at,
-                                    &stage_stop_rx,
-                                    &first_transfer_tx,
-                                    &mut tasks,
-                                ),
-                            }
-                        }
-                        spawned_count = desired;
-                    }
-
-                    let time_remaining_ms =
-                        (config.max_seconds * 1000).saturating_sub(elapsed_ms);
-                    let conns = active_connections.load(Ordering::Relaxed).max(1);
-                    let size = calc.suggested_request_size(conns, time_remaining_ms, config);
-                    suggested_size.store(size, Ordering::Relaxed);
-
-                    if let Some(interval) = config.progress_interval {
-                        let should_report = last_progress_at
-                            .map_or(true, |t| now.duration_since(t) >= interval);
-                        if should_report {
-                            last_progress_at = Some(now);
-                            on_progress(DownloadProgress {
-                                elapsed,
-                                bytes,
-                                mbps: blended_bps * 8.0 / 1_000_000.0,
-                                active_connections: active_connections.load(Ordering::Relaxed),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
+            spawn_worker_range(range, tasks, |idx, tasks| match mode {
+                TransportProtocol::Tcp => spawn_download_worker_tcp(
+                    idx,
+                    &ready_pool,
+                    &total_bytes,
+                    &request_attempts,
+                    &request_successes,
+                    &request_transport_errors,
+                    &response_read_errors,
+                    &active_connections,
+                    &per_server_bytes,
+                    &target_workers,
+                    &suggested_size,
+                    &first_byte_at,
+                    &stage_stop_rx,
+                    &first_transfer_tx,
+                    tasks,
+                ),
+                TransportProtocol::Xhr => spawn_download_worker_xhr(
+                    idx,
+                    client,
+                    &ready_pool,
+                    &default_guid,
+                    &total_bytes,
+                    &request_attempts,
+                    &request_successes,
+                    &request_http_errors,
+                    &request_transport_errors,
+                    &response_read_errors,
+                    &active_connections,
+                    &per_server_bytes,
+                    &target_workers,
+                    &suggested_size,
+                    &first_byte_at,
+                    &stage_stop_rx,
+                    &first_transfer_tx,
+                    tasks,
+                ),
+            });
+        },
+        |elapsed, bytes, mbps, active_connections| {
+            on_progress(DownloadProgress {
+                elapsed,
+                bytes,
+                mbps,
+                active_connections,
+            });
+        },
+    )
+    .await;
 
     drain_join_set(&mut tasks, STAGE_JOIN_GRACE_PERIOD).await;
 
     let throughput_result = calc.finish();
-    let actual_duration_ms = elapsed_ms_since(progress_clock_start);
+    let actual_duration_ms = elapsed_ms_since(loop_state.progress_clock_start);
     let bytes = total_bytes.load(Ordering::Relaxed);
     let per_server = ready_pool
         .iter()
@@ -323,49 +298,6 @@ async fn resolve_ready_download_pool(
         }
     })
     .await
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_download_workers_modern(
-    server_pool: &[SpeedtestServer],
-    worker_count: usize,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    per_server_bytes: &Arc<Vec<AtomicU64>>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
-    tasks: &mut JoinSet<()>,
-) {
-    if server_pool.is_empty() {
-        return;
-    }
-
-    for worker in 0..worker_count {
-        spawn_download_worker_tcp(
-            worker,
-            server_pool,
-            total_bytes,
-            request_attempts,
-            request_successes,
-            request_transport_errors,
-            response_read_errors,
-            active_connections,
-            per_server_bytes,
-            target_workers,
-            suggested_size,
-            first_byte_at,
-            stop_rx,
-            first_transfer_tx,
-            tasks,
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -476,55 +408,6 @@ fn spawn_download_worker_tcp(
             worker_active_connections.fetch_sub(1, Ordering::Relaxed);
         }
     });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_download_workers_modern_sdk(
-    client: &Client,
-    server_pool: &[SpeedtestServer],
-    default_guid: &str,
-    worker_count: usize,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_http_errors: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    per_server_bytes: &Arc<Vec<AtomicU64>>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
-    tasks: &mut JoinSet<()>,
-) {
-    if server_pool.is_empty() {
-        return;
-    }
-
-    for worker in 0..worker_count {
-        spawn_download_worker_xhr(
-            worker,
-            client,
-            server_pool,
-            default_guid,
-            total_bytes,
-            request_attempts,
-            request_successes,
-            request_http_errors,
-            request_transport_errors,
-            response_read_errors,
-            active_connections,
-            per_server_bytes,
-            target_workers,
-            suggested_size,
-            first_byte_at,
-            stop_rx,
-            first_transfer_tx,
-            tasks,
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
