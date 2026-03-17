@@ -25,6 +25,9 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_PROTOCOL_LEVEL: &str = "2";
 
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 #[derive(Debug, Clone, Copy)]
 pub struct UploadStatsSample {
     pub bytes: u64,
@@ -229,40 +232,10 @@ async fn probe_latency_samples_over_websocket_endpoint(
     endpoint: &Url,
     samples: usize,
 ) -> Result<Vec<f64>> {
-    let mut request = endpoint
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("failed building websocket request for {endpoint}"))?;
-
-    let headers = request.headers_mut();
-    headers.insert("Origin", "https://www.speedtest.net".parse()?);
-    headers.insert("User-Agent", "Mozilla/5.0".parse()?);
-    headers.insert("Accept", "*/*".parse()?);
-    headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
-    headers.insert("Cache-Control", "no-cache".parse()?);
-    headers.insert("Pragma", "no-cache".parse()?);
-
-    let (mut socket, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .with_context(|| format!("timed out connecting websocket {endpoint}"))?
-        .with_context(|| format!("failed to open websocket {endpoint}"))?;
+    let mut socket = connect_browser_websocket(endpoint).await?;
 
     debug!(endpoint = %endpoint, "websocket connected");
-
-    debug!(endpoint = %endpoint, "sending HI");
-    ws_send_text(&mut socket, &format!("HI\t{WS_PROTOCOL_LEVEL}\t"), "HI").await?;
-    debug!(endpoint = %endpoint, "waiting HELLO");
-    ws_expect_prefix(&mut socket, "HELLO", "HELLO handshake").await?;
-
-    debug!(endpoint = %endpoint, "sending GETIP");
-    ws_send_text(&mut socket, "GETIP", "GETIP").await?;
-    debug!(endpoint = %endpoint, "waiting YOURIP");
-    ws_expect_prefix(&mut socket, "YOURIP", "GETIP response").await?;
-
-    debug!(endpoint = %endpoint, "sending CAPABILITIES");
-    ws_send_text(&mut socket, "CAPABILITIES", "CAPABILITIES").await?;
-    debug!(endpoint = %endpoint, "waiting CAPABILITIES response");
-    ws_expect_prefix(&mut socket, "CAPABILITIES", "CAPABILITIES response").await?;
+    perform_speedtest_ws_handshake(&mut socket).await?;
 
     let mut successful_samples = Vec::with_capacity(samples);
     for sample_index in 0..samples {
@@ -311,32 +284,8 @@ async fn probe_latency_samples_over_websocket_endpoint_for_duration(
     duration: Duration,
     sender: Option<UnboundedSender<f64>>,
 ) -> Result<Vec<f64>> {
-    let mut request = endpoint
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("failed building websocket request for {endpoint}"))?;
-
-    let headers = request.headers_mut();
-    headers.insert("Origin", "https://www.speedtest.net".parse()?);
-    headers.insert("User-Agent", "Mozilla/5.0".parse()?);
-    headers.insert("Accept", "*/*".parse()?);
-    headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
-    headers.insert("Cache-Control", "no-cache".parse()?);
-    headers.insert("Pragma", "no-cache".parse()?);
-
-    let (mut socket, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .with_context(|| format!("timed out connecting websocket {endpoint}"))?
-        .with_context(|| format!("failed to open websocket {endpoint}"))?;
-
-    ws_send_text(&mut socket, &format!("HI\t{WS_PROTOCOL_LEVEL}\t"), "HI").await?;
-    ws_expect_prefix(&mut socket, "HELLO", "HELLO handshake").await?;
-
-    ws_send_text(&mut socket, "GETIP", "GETIP").await?;
-    ws_expect_prefix(&mut socket, "YOURIP", "GETIP response").await?;
-
-    ws_send_text(&mut socket, "CAPABILITIES", "CAPABILITIES").await?;
-    ws_expect_prefix(&mut socket, "CAPABILITIES", "CAPABILITIES response").await?;
+    let mut socket = connect_browser_websocket(endpoint).await?;
+    perform_speedtest_ws_handshake(&mut socket).await?;
 
     let mut successful_samples = Vec::new();
     let deadline = Instant::now() + duration;
@@ -384,23 +333,7 @@ async fn stream_upload_stats_over_endpoint(
     sample_interval_ms: u64,
     sender: &UnboundedSender<UploadStatsSample>,
 ) -> Result<()> {
-    let mut request = endpoint
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("failed building websocket request for {endpoint}"))?;
-
-    let headers = request.headers_mut();
-    headers.insert("Origin", "https://www.speedtest.net".parse()?);
-    headers.insert("User-Agent", "Mozilla/5.0".parse()?);
-    headers.insert("Accept", "*/*".parse()?);
-    headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
-    headers.insert("Cache-Control", "no-cache".parse()?);
-    headers.insert("Pragma", "no-cache".parse()?);
-
-    let (mut socket, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .with_context(|| format!("timed out connecting websocket {endpoint}"))?
-        .with_context(|| format!("failed to open websocket {endpoint}"))?;
+    let mut socket = connect_browser_websocket(endpoint).await?;
 
     let upload_stats_duration_ms = duration_seconds.saturating_mul(1_000);
     ws_send_text(&mut socket, &format!("HI {guid}"), "HI upload stats").await?;
@@ -482,13 +415,45 @@ fn websocket_endpoints(server: &SpeedtestServer) -> Result<Vec<Url>> {
     Ok(vec![secure, insecure])
 }
 
-async fn ws_send_text(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    text: &str,
-    action: &str,
+fn apply_browser_websocket_headers(
+    request: &mut tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> Result<()> {
+    let headers = request.headers_mut();
+    headers.insert("Origin", "https://www.speedtest.net".parse()?);
+    headers.insert("User-Agent", "Mozilla/5.0".parse()?);
+    headers.insert("Accept", "*/*".parse()?);
+    headers.insert("Accept-Language", "en-US,en;q=0.9".parse()?);
+    headers.insert("Cache-Control", "no-cache".parse()?);
+    headers.insert("Pragma", "no-cache".parse()?);
+    Ok(())
+}
+
+async fn connect_browser_websocket(endpoint: &Url) -> Result<WsStream> {
+    let mut request = endpoint
+        .as_str()
+        .into_client_request()
+        .with_context(|| format!("failed building websocket request for {endpoint}"))?;
+    apply_browser_websocket_headers(&mut request)?;
+
+    let (socket, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(request))
+        .await
+        .with_context(|| format!("timed out connecting websocket {endpoint}"))?
+        .with_context(|| format!("failed to open websocket {endpoint}"))?;
+    Ok(socket)
+}
+
+async fn perform_speedtest_ws_handshake(socket: &mut WsStream) -> Result<()> {
+    ws_send_text(socket, &format!("HI\t{WS_PROTOCOL_LEVEL}\t"), "HI").await?;
+    ws_expect_prefix(socket, "HELLO", "HELLO handshake").await?;
+
+    ws_send_text(socket, "GETIP", "GETIP").await?;
+    ws_expect_prefix(socket, "YOURIP", "GETIP response").await?;
+
+    ws_send_text(socket, "CAPABILITIES", "CAPABILITIES").await?;
+    ws_expect_prefix(socket, "CAPABILITIES", "CAPABILITIES response").await
+}
+
+async fn ws_send_text(socket: &mut WsStream, text: &str, action: &str) -> Result<()> {
     timeout(
         WS_IO_TIMEOUT,
         socket.send(Message::Text(text.to_string().into())),
@@ -498,13 +463,7 @@ async fn ws_send_text(
     .with_context(|| format!("failed sending websocket {action}"))
 }
 
-async fn ws_expect_prefix(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    expected_prefix: &str,
-    action: &str,
-) -> Result<()> {
+async fn ws_expect_prefix(socket: &mut WsStream, expected_prefix: &str, action: &str) -> Result<()> {
     loop {
         let frame = timeout(WS_IO_TIMEOUT, socket.next())
             .await
@@ -533,12 +492,7 @@ async fn ws_expect_prefix(
     }
 }
 
-async fn ws_next_text(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    action: &str,
-) -> Result<Option<String>> {
+async fn ws_next_text(socket: &mut WsStream, action: &str) -> Result<Option<String>> {
     let frame = timeout(WS_IO_TIMEOUT, socket.next())
         .await
         .with_context(|| format!("timed out waiting for websocket {action}"))?;

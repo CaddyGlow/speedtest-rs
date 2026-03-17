@@ -213,65 +213,7 @@ where
         variance_ms: selection.selected.variance_ms,
     });
 
-    let jitter_ms = calculate_jitter(&selection.selected.samples_ms);
-
-    let mut result = RunResult {
-        timestamp: current_timestamp()?,
-        speedtest_api: Some(mode.to_string()),
-        client: Some(ClientMeta {
-            ip: config.client.ip.clone(),
-            isp: config.client.isp.clone(),
-            country: config.client.country.clone(),
-            latitude: config.client.latitude,
-            longitude: config.client.longitude,
-            isp_id: None,
-            provider_hash: None,
-        }),
-        server: Some(map_server(
-            &selection.selected.server,
-            Some((
-                selection.selected.average_ms,
-                selection.selected.variance_ms.sqrt(),
-            )),
-            None,
-        )),
-        server_pool: Some(
-            selection
-                .transfer_pool
-                .iter()
-                .map(|server| {
-                    let latency = selection.latency_by_server.get(&server.id).copied();
-                    map_server(server, latency, None)
-                })
-                .collect::<Vec<_>>(),
-        ),
-        ping_ms: Some(selection.selected.average_ms),
-        jitter_ms: if jitter_ms > 0.0 { Some(jitter_ms) } else { None },
-        download: None,
-        download_latency_ms: None,
-        upload: None,
-        upload_latency_ms: None,
-        proxy: None,
-        sdk_selected_latency_samples_ms: (!selection.selected.samples_ms.is_empty())
-            .then(|| selection.selected.samples_ms.clone()),
-        sdk_download_intervals: None,
-        sdk_upload_intervals: None,
-        sdk_upload_remote_intervals: None,
-        sdk_download_latency_samples_ms: None,
-        sdk_upload_latency_samples_ms: None,
-        details: settings.details.then_some(RunDetails {
-            interval_seconds: 1,
-            selected_server_latency: SelectedServerLatencyDetails {
-                average_ms: selection.selected.average_ms,
-                variance_ms: selection.selected.variance_ms,
-                stddev_ms: Some(selection.selected.variance_ms.max(0.0).sqrt()),
-                samples_ms: (!selection.selected.samples_ms.is_empty())
-                    .then(|| selection.selected.samples_ms.clone()),
-            },
-            download: None,
-            upload: None,
-        }),
-    };
+    let mut result = build_initial_run_result(config, mode, settings, &selection)?;
 
     let mut stage_machine = StageMachine::new(settings.stage_order());
     while let Some(stage) = stage_machine.next() {
@@ -283,21 +225,11 @@ where
             }
             EngineStage::Download => {
                 let mut intervals = Vec::new();
-                let latency_server = selection.selected.server.clone();
-                let latency_client = client.clone();
-                let latency_seconds = settings.download_seconds;
-                let (download_rtt_tx, download_rtt_rx) = watch::channel(None);
-                let latency_task = tokio::spawn(async move {
-                    select::collect_loaded_latency_samples_with_progress(
-                        &latency_client,
-                        &latency_server,
-                        latency_seconds,
-                        |iqm| {
-                            let _ = download_rtt_tx.send(Some(iqm));
-                        },
-                    )
-                    .await
-                });
+                let (download_rtt_rx, latency_task) = spawn_loaded_latency_task(
+                    client,
+                    &selection.selected.server,
+                    settings.download_seconds,
+                );
 
                 let download_config = TransferConfig {
                     connections: clamp_worker_count(settings.download_connections),
@@ -338,13 +270,7 @@ where
                 .await?;
 
                 let download_latency_samples = latency_task.await.unwrap_or_default();
-                let download_latency_avg = if download_latency_samples.is_empty() {
-                    None
-                } else {
-                    let sum: f64 = download_latency_samples.iter().sum();
-                    Some(sum / download_latency_samples.len() as f64)
-                };
-                result.download_latency_ms = download_latency_avg;
+                result.download_latency_ms = average_latency_ms(&download_latency_samples);
                 result.sdk_download_latency_samples_ms =
                     (!download_latency_samples.is_empty()).then_some(download_latency_samples);
 
@@ -355,38 +281,18 @@ where
                     stats.mbps,
                 );
 
-                result.download = Some(BenchmarkResult {
-                    mbps: stats.mbps,
-                    bytes: stats.bytes,
-                    duration_seconds: settings.download_seconds,
-                    connections: download_config.connections,
-                    actual_duration_seconds: Some(stats.actual_duration_ms as f64 / 1_000.0),
-                    average_mbps: stats.throughput.as_ref().map(|t| t.average_mbps()),
-                    mst_mbps: stats.throughput.as_ref().map(|t| t.mst_mbps()),
-                });
+                result.download = Some(build_benchmark_result(
+                    stats.mbps,
+                    stats.bytes,
+                    settings.download_seconds,
+                    download_config.connections,
+                    stats.actual_duration_ms,
+                    stats.throughput.as_ref(),
+                ));
                 result.sdk_download_intervals =
                     (!intervals.is_empty()).then_some(intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
-                    let mst_speeds = stats.throughput.as_ref().map(|t| MstSpeedsOut {
-                        average: t.average_bps * 8.0 / 1_000_000.0,
-                        mst_66_20: t.mst_66_20_bps * 8.0 / 1_000_000.0,
-                        mst_66_30: t.mst_66_30_bps * 8.0 / 1_000_000.0,
-                        mst_75_30: t.mst_75_30_bps * 8.0 / 1_000_000.0,
-                        blended: t.blended_bps * 8.0 / 1_000_000.0,
-                        superspeed: t.superspeed_bps * 8.0 / 1_000_000.0,
-                    });
-                    let mst_buckets = stats.throughput.as_ref().map(|t| {
-                        t.buckets_500ms
-                            .iter()
-                            .map(|b| MstBucketOut {
-                                start_ms: b.start_ms,
-                                stop_ms: b.stop_ms,
-                                bytes: b.bytes,
-                                bandwidth_mbps: b.bandwidth_bytes_per_sec() * 8.0 / 1_000_000.0,
-                            })
-                            .collect()
-                    });
                     details.download = Some(DirectionDetails {
                         request_attempts: stats.request_attempts,
                         request_successes: stats.request_successes,
@@ -395,23 +301,12 @@ where
                         response_read_errors: stats.response_read_errors,
                         intervals,
                         remote_intervals: None,
-                        mst_speeds,
-                        mst_buckets,
+                        mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
+                        mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
                     });
                 }
 
-                if let Some(server_pool) = result.server_pool.as_mut() {
-                    for server in server_pool {
-                        if let Some(entry) = stats
-                            .per_server
-                            .iter()
-                            .find(|entry| entry.server_id == server.id)
-                        {
-                            server.download_avg_mbps = Some(entry.mbps);
-                            server.download_bytes = Some(entry.bytes);
-                        }
-                    }
-                }
+                apply_download_stats_to_server_pool(&mut result.server_pool, &stats.per_server);
 
                 on_event(EngineEvent::StageResult {
                     stage: EngineStage::Download,
@@ -423,22 +318,11 @@ where
             }
             EngineStage::Upload => {
                 let mut intervals = Vec::new();
-                let mut remote_intervals = Vec::new();
-                let latency_server = selection.selected.server.clone();
-                let latency_client = client.clone();
-                let latency_seconds = settings.upload_seconds;
-                let (upload_rtt_tx, upload_rtt_rx) = watch::channel(None);
-                let latency_task = tokio::spawn(async move {
-                    select::collect_loaded_latency_samples_with_progress(
-                        &latency_client,
-                        &latency_server,
-                        latency_seconds,
-                        |iqm| {
-                            let _ = upload_rtt_tx.send(Some(iqm));
-                        },
-                    )
-                    .await
-                });
+                let (upload_rtt_rx, latency_task) = spawn_loaded_latency_task(
+                    client,
+                    &selection.selected.server,
+                    settings.upload_seconds,
+                );
 
                 let upload_config = TransferConfig {
                     connections: clamp_worker_count(settings.upload_connections),
@@ -479,13 +363,7 @@ where
                 .await?;
 
                 let upload_latency_samples = latency_task.await.unwrap_or_default();
-                let upload_latency_avg = if upload_latency_samples.is_empty() {
-                    None
-                } else {
-                    let sum: f64 = upload_latency_samples.iter().sum();
-                    Some(sum / upload_latency_samples.len() as f64)
-                };
-                result.upload_latency_ms = upload_latency_avg;
+                result.upload_latency_ms = average_latency_ms(&upload_latency_samples);
                 result.sdk_upload_latency_samples_ms =
                     (!upload_latency_samples.is_empty()).then_some(upload_latency_samples);
 
@@ -496,57 +374,22 @@ where
                     stats.mbps,
                 );
 
-                for sample in &stats.remote_samples {
-                    if sample.elapsed_ms == 0 {
-                        continue;
-                    }
-                    let elapsed_seconds = sample.elapsed_ms as f64 / 1_000.0;
-                    let mbps =
-                        (sample.bytes as f64 * 8.0) / 1_000_000.0 / elapsed_seconds.max(0.001);
-                    if !mbps.is_finite() || mbps < 0.0 {
-                        continue;
-                    }
-                    push_interval(
-                        &mut remote_intervals,
-                        elapsed_seconds.min(settings.upload_seconds as f64),
-                        sample.bytes,
-                        mbps,
-                    );
-                }
+                let remote_intervals =
+                    build_remote_upload_intervals(&stats.remote_samples, settings.upload_seconds);
 
-                result.upload = Some(BenchmarkResult {
-                    mbps: stats.mbps,
-                    bytes: stats.bytes,
-                    duration_seconds: settings.upload_seconds,
-                    connections: upload_config.connections,
-                    actual_duration_seconds: Some(stats.actual_duration_ms as f64 / 1_000.0),
-                    average_mbps: stats.throughput.as_ref().map(|t| t.average_mbps()),
-                    mst_mbps: stats.throughput.as_ref().map(|t| t.mst_mbps()),
-                });
+                result.upload = Some(build_benchmark_result(
+                    stats.mbps,
+                    stats.bytes,
+                    settings.upload_seconds,
+                    upload_config.connections,
+                    stats.actual_duration_ms,
+                    stats.throughput.as_ref(),
+                ));
                 result.sdk_upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
                 result.sdk_upload_remote_intervals =
                     (!remote_intervals.is_empty()).then_some(remote_intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
-                    let mst_speeds = stats.throughput.as_ref().map(|t| MstSpeedsOut {
-                        average: t.average_bps * 8.0 / 1_000_000.0,
-                        mst_66_20: t.mst_66_20_bps * 8.0 / 1_000_000.0,
-                        mst_66_30: t.mst_66_30_bps * 8.0 / 1_000_000.0,
-                        mst_75_30: t.mst_75_30_bps * 8.0 / 1_000_000.0,
-                        blended: t.blended_bps * 8.0 / 1_000_000.0,
-                        superspeed: t.superspeed_bps * 8.0 / 1_000_000.0,
-                    });
-                    let mst_buckets = stats.throughput.as_ref().map(|t| {
-                        t.buckets_500ms
-                            .iter()
-                            .map(|b| MstBucketOut {
-                                start_ms: b.start_ms,
-                                stop_ms: b.stop_ms,
-                                bytes: b.bytes,
-                                bandwidth_mbps: b.bandwidth_bytes_per_sec() * 8.0 / 1_000_000.0,
-                            })
-                            .collect()
-                    });
                     details.upload = Some(DirectionDetails {
                         request_attempts: stats.request_attempts,
                         request_successes: stats.request_successes,
@@ -556,8 +399,8 @@ where
                         intervals,
                         remote_intervals: (!remote_intervals.is_empty())
                             .then_some(remote_intervals),
-                        mst_speeds,
-                        mst_buckets,
+                        mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
+                        mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
                     });
                 }
 
@@ -615,6 +458,191 @@ struct SelectionOutcome {
     selected: ServerLatency,
     transfer_pool: Vec<SpeedtestServer>,
     latency_by_server: HashMap<u64, (f64, f64)>,
+}
+
+fn build_initial_run_result(
+    config: &SpeedtestConfig,
+    mode: TransportProtocol,
+    settings: &EngineSettings,
+    selection: &SelectionOutcome,
+) -> Result<RunResult> {
+    let jitter_ms = calculate_jitter(&selection.selected.samples_ms);
+
+    Ok(RunResult {
+        timestamp: current_timestamp()?,
+        speedtest_api: Some(mode.to_string()),
+        client: Some(ClientMeta {
+            ip: config.client.ip.clone(),
+            isp: config.client.isp.clone(),
+            country: config.client.country.clone(),
+            latitude: config.client.latitude,
+            longitude: config.client.longitude,
+            isp_id: None,
+            provider_hash: None,
+        }),
+        server: Some(map_server(
+            &selection.selected.server,
+            Some((
+                selection.selected.average_ms,
+                selection.selected.variance_ms.sqrt(),
+            )),
+            None,
+        )),
+        server_pool: Some(
+            selection
+                .transfer_pool
+                .iter()
+                .map(|server| {
+                    let latency = selection.latency_by_server.get(&server.id).copied();
+                    map_server(server, latency, None)
+                })
+                .collect::<Vec<_>>(),
+        ),
+        ping_ms: Some(selection.selected.average_ms),
+        jitter_ms: if jitter_ms > 0.0 { Some(jitter_ms) } else { None },
+        download: None,
+        download_latency_ms: None,
+        upload: None,
+        upload_latency_ms: None,
+        proxy: None,
+        sdk_selected_latency_samples_ms: (!selection.selected.samples_ms.is_empty())
+            .then(|| selection.selected.samples_ms.clone()),
+        sdk_download_intervals: None,
+        sdk_upload_intervals: None,
+        sdk_upload_remote_intervals: None,
+        sdk_download_latency_samples_ms: None,
+        sdk_upload_latency_samples_ms: None,
+        details: settings.details.then_some(RunDetails {
+            interval_seconds: 1,
+            selected_server_latency: SelectedServerLatencyDetails {
+                average_ms: selection.selected.average_ms,
+                variance_ms: selection.selected.variance_ms,
+                stddev_ms: Some(selection.selected.variance_ms.max(0.0).sqrt()),
+                samples_ms: (!selection.selected.samples_ms.is_empty())
+                    .then(|| selection.selected.samples_ms.clone()),
+            },
+            download: None,
+            upload: None,
+        }),
+    })
+}
+
+fn spawn_loaded_latency_task(
+    client: &Client,
+    server: &SpeedtestServer,
+    stage_seconds: u64,
+) -> (
+    watch::Receiver<Option<f64>>,
+    tokio::task::JoinHandle<Vec<f64>>,
+) {
+    let latency_server = server.clone();
+    let latency_client = client.clone();
+    let (rtt_tx, rtt_rx) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        select::collect_loaded_latency_samples_with_progress(
+            &latency_client,
+            &latency_server,
+            stage_seconds,
+            |iqm| {
+                let _ = rtt_tx.send(Some(iqm));
+            },
+        )
+        .await
+    });
+
+    (rtt_rx, task)
+}
+
+fn average_latency_ms(samples: &[f64]) -> Option<f64> {
+    (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+fn build_benchmark_result(
+    mbps: f64,
+    bytes: u64,
+    duration_seconds: u64,
+    connections: usize,
+    actual_duration_ms: u64,
+    throughput: Option<&crate::speedtest::throughput::ThroughputResult>,
+) -> BenchmarkResult {
+    BenchmarkResult {
+        mbps,
+        bytes,
+        duration_seconds,
+        connections,
+        actual_duration_seconds: Some(actual_duration_ms as f64 / 1_000.0),
+        average_mbps: throughput.map(|it| it.average_mbps()),
+        mst_mbps: throughput.map(|it| it.mst_mbps()),
+    }
+}
+
+fn build_mst_speeds(
+    throughput: Option<&crate::speedtest::throughput::ThroughputResult>,
+) -> Option<MstSpeedsOut> {
+    throughput.map(|t| MstSpeedsOut {
+        average: t.average_bps * 8.0 / 1_000_000.0,
+        mst_66_20: t.mst_66_20_bps * 8.0 / 1_000_000.0,
+        mst_66_30: t.mst_66_30_bps * 8.0 / 1_000_000.0,
+        mst_75_30: t.mst_75_30_bps * 8.0 / 1_000_000.0,
+        blended: t.blended_bps * 8.0 / 1_000_000.0,
+        superspeed: t.superspeed_bps * 8.0 / 1_000_000.0,
+    })
+}
+
+fn build_mst_buckets(
+    throughput: Option<&crate::speedtest::throughput::ThroughputResult>,
+) -> Option<Vec<MstBucketOut>> {
+    throughput.map(|t| {
+        t.buckets_500ms
+            .iter()
+            .map(|b| MstBucketOut {
+                start_ms: b.start_ms,
+                stop_ms: b.stop_ms,
+                bytes: b.bytes,
+                bandwidth_mbps: b.bandwidth_bytes_per_sec() * 8.0 / 1_000_000.0,
+            })
+            .collect()
+    })
+}
+
+fn build_remote_upload_intervals(
+    samples: &[crate::speedtest::browser_protocol::UploadStatsSample],
+    stage_seconds: u64,
+) -> Vec<ThroughputInterval> {
+    let mut intervals = Vec::new();
+
+    for sample in samples {
+        if sample.elapsed_ms == 0 {
+            continue;
+        }
+        let elapsed_seconds = sample.elapsed_ms as f64 / 1_000.0;
+        let mbps = (sample.bytes as f64 * 8.0) / 1_000_000.0 / elapsed_seconds.max(0.001);
+        if !mbps.is_finite() || mbps < 0.0 {
+            continue;
+        }
+        push_interval(
+            &mut intervals,
+            elapsed_seconds.min(stage_seconds as f64),
+            sample.bytes,
+            mbps,
+        );
+    }
+
+    intervals
+}
+
+fn apply_download_stats_to_server_pool(
+    server_pool: &mut Option<Vec<Server>>,
+    per_server: &[download::PerServerDownloadStats],
+) {
+    if let Some(server_pool) = server_pool.as_mut() {
+        for server in server_pool {
+            if let Some(entry) = per_server.iter().find(|entry| entry.server_id == server.id) {
+                server.download_avg_mbps = Some(entry.mbps);
+                server.download_bytes = Some(entry.bytes);
+            }
+        }
+    }
 }
 
 async fn select_server<F>(
