@@ -196,7 +196,6 @@ where
 
     let poll_interval = STAGE_POLL_INTERVAL;
     let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
-    let min_duration_ms = config.min_seconds * 1000;
     let mut progress_clock_start = None;
     let mut transfer_started = false;
     let mut last_progress_at: Option<Instant> = None;
@@ -241,11 +240,6 @@ where
 
                     if let Some(sample) = latest_remote_sample {
                         let _ = remote_sample_rate(sample, elapsed);
-                    }
-
-                    if min_duration_ms > 0 && calc.should_stop_early(min_duration_ms) {
-                        let _ = stage_stop_tx.send(true);
-                        break;
                     }
 
                     let elapsed_ms = elapsed.as_millis() as u64;
@@ -958,7 +952,6 @@ mod tests {
         let test_config = crate::speedtest::throughput::TransferConfig {
             connections: 1,
             max_seconds: 1,
-            min_seconds: 0,
             progress_interval: None,
         };
         let result = timeout(

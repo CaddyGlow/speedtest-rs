@@ -13,7 +13,6 @@ use std::time::Duration;
 pub struct TransferConfig {
     pub connections: usize,
     pub max_seconds: u64,
-    pub min_seconds: u64,
     pub progress_interval: Option<Duration>,
 }
 

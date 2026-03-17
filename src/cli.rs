@@ -81,10 +81,6 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 15, value_parser = parse_positive_u64)]
     pub upload_seconds: u64,
 
-    /// Minimum seconds before early exit is allowed (0 disables early exit)
-    #[arg(long, default_value_t = 0)]
-    pub min_seconds: u64,
-
     /// Skip upload phase
     #[arg(long, conflicts_with = "upload_only")]
     pub download_only: bool,
@@ -224,7 +220,6 @@ impl Default for Cli {
                 upload_connections: 8,
                 download_seconds: 15,
                 upload_seconds: 15,
-                min_seconds: 0,
                 download_only: false,
                 upload_only: false,
                 proxy: None,
@@ -344,21 +339,8 @@ mod tests {
 
         assert!(matches!(args.mode, super::ModernTransportMode::Xhr));
         assert_eq!(args.pool_size, 4);
-        assert_eq!(args.min_seconds, 0);
         assert!(!args.details);
         assert!(!args.no_progress);
-    }
-
-    #[test]
-    fn parses_run_min_seconds() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--min-seconds", "3"])
-            .expect("run --min-seconds should parse");
-
-        let Some(Command::Run(args)) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(args.min_seconds, 3);
     }
 
     #[test]

@@ -210,7 +210,6 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         upload_connections: effective_args.upload_connections,
         download_seconds: effective_args.download_seconds,
         upload_seconds: effective_args.upload_seconds,
-        min_seconds: effective_args.min_seconds,
         download_only: effective_args.download_only,
         upload_only: effective_args.upload_only,
         details: effective_args.details,

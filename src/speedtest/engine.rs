@@ -81,7 +81,6 @@ pub struct EngineSettings {
     pub upload_connections: usize,
     pub download_seconds: u64,
     pub upload_seconds: u64,
-    pub min_seconds: u64,
     pub download_only: bool,
     pub upload_only: bool,
     pub details: bool,
@@ -99,7 +98,6 @@ impl Default for EngineSettings {
             upload_connections: 8,
             download_seconds: 15,
             upload_seconds: 15,
-            min_seconds: 0,
             download_only: false,
             upload_only: false,
             details: false,
@@ -295,7 +293,6 @@ where
                 let download_config = TransferConfig {
                     connections: clamp_worker_count(settings.download_connections),
                     max_seconds: settings.download_seconds,
-                    min_seconds: settings.min_seconds,
                     progress_interval: settings.progress_interval,
                 };
                 let stats = download::run_download_test(
@@ -427,7 +424,6 @@ where
                 let upload_config = TransferConfig {
                     connections: clamp_worker_count(settings.upload_connections),
                     max_seconds: settings.upload_seconds,
-                    min_seconds: settings.min_seconds,
                     progress_interval: settings.progress_interval,
                 };
                 let stats = upload::run_upload_test(
