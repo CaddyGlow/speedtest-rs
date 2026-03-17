@@ -239,11 +239,16 @@ where
                     let now = Instant::now();
                     let local_bytes = total_bytes.load(Ordering::Relaxed);
                     let elapsed = now.saturating_duration_since(clock_start);
-                    let blended_bps = calc.record_sample(elapsed.as_millis() as u64, local_bytes);
+                    let remote_progress = latest_remote_sample.and_then(|sample| {
+                        remote_sample_rate(sample, elapsed).map(|(bytes, mbps)| (sample, bytes, mbps))
+                    });
 
-                    if let Some(sample) = latest_remote_sample {
-                        let _ = remote_sample_rate(sample, elapsed);
-                    }
+                    let (sample_elapsed_ms, sample_bytes) = if let Some((sample, bytes, _)) = remote_progress {
+                        (sample.elapsed_ms, bytes)
+                    } else {
+                        (elapsed.as_millis() as u64, local_bytes)
+                    };
+                    let blended_bps = calc.record_sample(sample_elapsed_ms, sample_bytes);
 
                     let elapsed_ms = elapsed.as_millis() as u64;
                     let desired = calc.desired_connections(config.connections);
@@ -302,10 +307,16 @@ where
                             .map_or(true, |t| now.duration_since(t) >= interval);
                         if should_report {
                             last_progress_at = Some(now);
+                            let (progress_bytes, progress_mbps) =
+                                if let Some((_, bytes, mbps)) = remote_progress {
+                                    (bytes, mbps)
+                                } else {
+                                    (sample_bytes, blended_bps * 8.0 / 1_000_000.0)
+                                };
                             on_progress(UploadProgress {
                                 elapsed,
-                                bytes: local_bytes,
-                                mbps: blended_bps * 8.0 / 1_000_000.0,
+                                bytes: progress_bytes,
+                                mbps: progress_mbps,
                                 active_connections: active_connections.load(Ordering::Relaxed),
                             });
                         }
