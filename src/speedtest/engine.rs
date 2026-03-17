@@ -99,7 +99,7 @@ impl Default for EngineSettings {
             upload_connections: 8,
             download_seconds: 15,
             upload_seconds: 15,
-            min_seconds: 5,
+            min_seconds: 0,
             download_only: false,
             upload_only: false,
             details: false,
