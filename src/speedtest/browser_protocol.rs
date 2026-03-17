@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{SinkExt, StreamExt};
-use reqwest::Client;
+use futures_util::{SinkExt, StreamExt, stream};
+use reqwest::{Body, Client};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
@@ -665,13 +666,57 @@ pub async fn upload(
     _guid: &str,
     payload: &[u8],
 ) -> std::result::Result<u64, TransferRequestError> {
+    upload_streaming(client, server, payload, None, None, None).await
+}
+
+pub async fn upload_streaming(
+    client: &Client,
+    server: &SpeedtestServer,
+    payload: &[u8],
+    live_counter: Option<Arc<AtomicU64>>,
+    first_byte_at: Option<Arc<OnceLock<Instant>>>,
+    first_transfer_tx: Option<watch::Sender<bool>>,
+) -> std::result::Result<u64, TransferRequestError> {
+    const UPLOAD_CHUNK_BYTES: usize = 32 * 1024;
     let body_len = payload.len() as u64;
+    let payload = Arc::<[u8]>::from(payload.to_vec());
     let mut last_error = None;
 
     for url in endpoint_urls(server, "upload").map_err(|_| TransferRequestError::InvalidEndpoint)? {
+        let payload = Arc::clone(&payload);
+        let live_counter = live_counter.clone();
+        let first_byte_at = first_byte_at.clone();
+        let first_transfer_tx = first_transfer_tx.clone();
+        let body = Body::wrap_stream(stream::unfold(0usize, move |offset| {
+            let payload = Arc::clone(&payload);
+            let live_counter = live_counter.clone();
+            let first_byte_at = first_byte_at.clone();
+            let first_transfer_tx = first_transfer_tx.clone();
+            async move {
+                if offset >= payload.len() {
+                    return None;
+                }
+
+                let end = (offset + UPLOAD_CHUNK_BYTES).min(payload.len());
+                let chunk = payload[offset..end].to_vec();
+                let len = chunk.len() as u64;
+                if let Some(first_byte_at) = first_byte_at
+                    && first_byte_at.set(Instant::now()).is_ok()
+                    && let Some(first_transfer_tx) = &first_transfer_tx
+                {
+                    let _ = first_transfer_tx.send(true);
+                }
+                if let Some(live_counter) = &live_counter {
+                    live_counter.fetch_add(len, Ordering::Relaxed);
+                }
+
+                Some((Ok::<Vec<u8>, std::io::Error>(chunk), end))
+            }
+        }));
+
         let response = match browser_headers(client.post(url.clone()))
             .header("Content-Type", "application/octet-stream")
-            .body(payload.to_vec())
+            .body(body)
             .send()
             .await
         {

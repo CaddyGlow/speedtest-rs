@@ -79,15 +79,35 @@ pub async fn download(
 }
 
 pub async fn upload(stream: &mut TcpStream, total_size: usize) -> Result<u64> {
+    upload_with_progress(stream, total_size, &[], &OnceLock::new(), None).await
+}
+
+pub async fn upload_with_progress(
+    stream: &mut TcpStream,
+    total_size: usize,
+    live_counters: &[&AtomicU64],
+    first_byte_at: &OnceLock<Instant>,
+    first_transfer_tx: Option<&watch::Sender<bool>>,
+) -> Result<u64> {
     let command = format!("UPLOAD {total_size} 0\n");
     write_all_with_timeout(stream, command.as_bytes(), "UPLOAD command").await?;
 
     let payload_size = total_size.saturating_sub(command.len());
     let mut remaining = payload_size;
+    let mut total = 0_u64;
     while remaining > 0 {
-        let chunk = min(remaining, DATA_BLOCK.len());
-        write_all_with_timeout(stream, &DATA_BLOCK[..chunk], "UPLOAD payload").await?;
-        remaining -= chunk;
+        let chunk_len = min(remaining, DATA_BLOCK.len());
+        write_all_with_timeout(stream, &DATA_BLOCK[..chunk_len], "UPLOAD payload").await?;
+        if first_byte_at.set(Instant::now()).is_ok() && let Some(first_transfer_tx) = first_transfer_tx
+        {
+            let _ = first_transfer_tx.send(true);
+        }
+        let chunk = chunk_len as u64;
+        total += chunk;
+        for counter in live_counters {
+            counter.fetch_add(chunk, Ordering::Relaxed);
+        }
+        remaining -= chunk_len;
     }
 
     let line = read_line_with_timeout(stream, "UPLOAD response").await?;
@@ -95,7 +115,7 @@ pub async fn upload(stream: &mut TcpStream, total_size: usize) -> Result<u64> {
         bail!("modern UPLOAD received invalid response '{line}'");
     }
 
-    Ok(payload_size as u64)
+    Ok(total)
 }
 
 pub async fn quit(stream: &mut TcpStream) -> Result<()> {
