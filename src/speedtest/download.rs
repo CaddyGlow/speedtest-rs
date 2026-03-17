@@ -21,8 +21,6 @@ const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STAGE_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const SERVER_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_READINESS_BYTES: usize = 64 * 1024;
-const DEFAULT_DOWNLOAD_SIZE: usize = 25_000_000;
-
 #[derive(Debug, Clone)]
 pub struct DownloadStats {
     pub bytes: u64,
@@ -63,7 +61,7 @@ pub async fn run_download_test<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let worker_count = clamp_worker_count(config.connections);
+    let worker_count = clamp_worker_count(config.initial_connections());
     let total_bytes = Arc::new(AtomicU64::new(0));
     let request_attempts = Arc::new(AtomicU64::new(0));
     let request_successes = Arc::new(AtomicU64::new(0));
@@ -98,7 +96,7 @@ where
     let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
     let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
     let target_workers = Arc::new(AtomicUsize::new(worker_count));
-    let suggested_size = Arc::new(AtomicUsize::new(DEFAULT_DOWNLOAD_SIZE));
+    let suggested_size = Arc::new(AtomicUsize::new(config.start_request_size));
 
     let mut tasks = JoinSet::new();
     let mut spawned_count = worker_count;
@@ -225,7 +223,7 @@ where
                     let time_remaining_ms =
                         (config.max_seconds * 1000).saturating_sub(elapsed_ms);
                     let conns = active_connections.load(Ordering::Relaxed).max(1);
-                    let size = calc.suggested_request_size(conns, time_remaining_ms);
+                    let size = calc.suggested_request_size(conns, time_remaining_ms, config);
                     suggested_size.store(size, Ordering::Relaxed);
 
                     if let Some(interval) = config.progress_interval {
@@ -762,8 +760,13 @@ mod tests {
 
         let test_config = crate::speedtest::throughput::TransferConfig {
             connections: 1,
+            initial_connections: 1,
             max_seconds: 1,
             progress_interval: None,
+            request_target_ms: 1_000,
+            start_request_size: 25_000_000,
+            min_request_size: 32 * 1024,
+            max_request_size: 25 * 1024 * 1024,
         };
         let result = timeout(
             Duration::from_secs(3),

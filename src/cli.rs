@@ -66,7 +66,7 @@ pub struct RunArgs {
     pub latency_samples: usize,
 
     /// Parallel download workers
-    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 24, value_parser = parse_positive_usize)]
     pub download_connections: usize,
 
     /// Parallel upload workers
@@ -216,7 +216,7 @@ impl Default for Cli {
                 candidate_servers: 10,
                 pool_size: 4,
                 latency_samples: 10,
-                download_connections: 8,
+                download_connections: 24,
                 upload_connections: 8,
                 download_seconds: 15,
                 upload_seconds: 15,

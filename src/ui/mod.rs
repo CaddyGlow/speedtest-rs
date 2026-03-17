@@ -69,7 +69,7 @@ impl Ui {
             return None;
         }
 
-        Some(Duration::from_millis(250))
+        Some(Duration::from_millis(50))
     }
 
     pub fn update_speed_progress(&mut self, progress: &SpeedProgress, sample: SpeedProgressSample) {

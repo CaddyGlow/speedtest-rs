@@ -25,6 +25,9 @@ pub struct SpeedProgressBar {
     bar: ProgressBar,
     sparkline_bar: ProgressBar,
     sparkline: RefCell<Sparkline>,
+    last_sample_bytes: Cell<u64>,
+    last_sample_elapsed_nanos: Cell<u128>,
+    smoothed_interval_mbps: Cell<f64>,
     last_non_zero_mbps: Cell<f64>,
 }
 
@@ -103,6 +106,9 @@ impl CompactUi {
             bar,
             sparkline_bar,
             sparkline: RefCell::new(Sparkline::new(sparkline_width)),
+            last_sample_bytes: Cell::new(0),
+            last_sample_elapsed_nanos: Cell::new(0),
+            smoothed_interval_mbps: Cell::new(0.0),
             last_non_zero_mbps: Cell::new(0.0),
         }
     }
@@ -111,7 +117,14 @@ impl CompactUi {
         let elapsed_secs = sample.elapsed.as_secs().min(progress.total_seconds);
         progress.bar.set_position(elapsed_secs);
         progress.bar.set_message(progress.phase.clone());
-        let mut mbps = sample.mbps;
+        let mut mbps = smooth_interval_mbps(
+            sample.bytes,
+            sample.elapsed.as_nanos(),
+            progress.last_sample_bytes.get(),
+            progress.last_sample_elapsed_nanos.get(),
+            progress.smoothed_interval_mbps.get(),
+            sample.mbps,
+        );
         if !mbps.is_finite() {
             mbps = 0.0;
         }
@@ -119,9 +132,14 @@ impl CompactUi {
             let previous = progress.last_non_zero_mbps.get();
             if previous > 0.0 { previous } else { 0.0 }
         } else {
+            progress.smoothed_interval_mbps.set(mbps);
             progress.last_non_zero_mbps.set(mbps);
             mbps
         };
+        progress.last_sample_bytes.set(sample.bytes);
+        progress
+            .last_sample_elapsed_nanos
+            .set(sample.elapsed.as_nanos());
         progress.bar.set_prefix(format!(
             "{:7.2} Mbps {:.1} MB",
             mbps,
@@ -129,7 +147,7 @@ impl CompactUi {
         ));
 
         let mut sparkline = progress.sparkline.borrow_mut();
-        sparkline.push(sample.mbps);
+        sparkline.push(mbps);
         progress.sparkline_bar.set_message(sparkline.render());
     }
 
@@ -151,5 +169,95 @@ impl CompactUi {
             metric.bar.finish_and_clear();
         }
         self.phase.finish_and_clear();
+    }
+}
+
+fn smooth_interval_mbps(
+    current_bytes: u64,
+    current_elapsed_nanos: u128,
+    previous_bytes: u64,
+    previous_elapsed_nanos: u128,
+    previous_smoothed_mbps: f64,
+    fallback_mbps: f64,
+) -> f64 {
+    let Some(interval_mbps) = estimate_interval_mbps(
+        current_bytes,
+        current_elapsed_nanos,
+        previous_bytes,
+        previous_elapsed_nanos,
+    ) else {
+        return if previous_smoothed_mbps > 0.0 {
+            previous_smoothed_mbps
+        } else {
+            fallback_mbps
+        };
+    };
+
+    if previous_smoothed_mbps <= 0.0 || !previous_smoothed_mbps.is_finite() {
+        return interval_mbps;
+    }
+
+    // Use a 1s EMA time constant so the live display reacts quickly
+    // without following every 250ms burst from concurrent transfers.
+    let elapsed_seconds =
+        (current_elapsed_nanos.saturating_sub(previous_elapsed_nanos)) as f64 / 1_000_000_000.0;
+    let alpha = (elapsed_seconds / 1.0).clamp(0.0, 1.0);
+    previous_smoothed_mbps + alpha * (interval_mbps - previous_smoothed_mbps)
+}
+
+fn estimate_interval_mbps(
+    current_bytes: u64,
+    current_elapsed_nanos: u128,
+    previous_bytes: u64,
+    previous_elapsed_nanos: u128,
+) -> Option<f64> {
+    if current_elapsed_nanos <= previous_elapsed_nanos || current_bytes < previous_bytes {
+        return None;
+    }
+
+    let elapsed_nanos = current_elapsed_nanos - previous_elapsed_nanos;
+    if elapsed_nanos == 0 {
+        return None;
+    }
+
+    let delta_bytes = current_bytes - previous_bytes;
+    if delta_bytes == 0 {
+        return None;
+    }
+
+    let elapsed_seconds = elapsed_nanos as f64 / 1_000_000_000.0;
+    let mbps = (delta_bytes as f64 * 8.0) / elapsed_seconds / 1_000_000.0;
+
+    mbps.is_finite().then_some(mbps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{estimate_interval_mbps, smooth_interval_mbps};
+
+    #[test]
+    fn estimate_interval_speed_uses_byte_delta() {
+        let mbps = estimate_interval_mbps(1_000_000, 1_000_000_000, 200_000, 500_000_000);
+        assert!((mbps.unwrap() - 12.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn estimate_interval_speed_returns_none_without_progress() {
+        let mbps = estimate_interval_mbps(500_000, 1_000_000_000, 500_000, 500_000_000);
+        assert!(mbps.is_none());
+    }
+
+    #[test]
+    fn smooth_interval_speed_blends_toward_latest_sample() {
+        let smoothed = smooth_interval_mbps(
+            1_000_000,
+            1_000_000_000,
+            500_000,
+            500_000_000,
+            4.0,
+            3.2,
+        );
+        assert!(smoothed > 4.0);
+        assert!(smoothed < 8.0);
     }
 }

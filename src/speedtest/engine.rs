@@ -94,7 +94,7 @@ impl Default for EngineSettings {
             candidate_servers: 10,
             modern_pool_size: 4,
             latency_samples: 10,
-            download_connections: 8,
+            download_connections: 24,
             upload_connections: 8,
             download_seconds: 15,
             upload_seconds: 15,
@@ -292,8 +292,13 @@ where
 
                 let download_config = TransferConfig {
                     connections: clamp_worker_count(settings.download_connections),
+                    initial_connections: 4,
                     max_seconds: settings.download_seconds,
                     progress_interval: settings.progress_interval,
+                    request_target_ms: 5_000,
+                    start_request_size: 25_000_000,
+                    min_request_size: 25_000_000,
+                    max_request_size: 250_000_000,
                 };
                 let stats = download::run_download_test(
                     client,
@@ -423,8 +428,13 @@ where
 
                 let upload_config = TransferConfig {
                     connections: clamp_worker_count(settings.upload_connections),
+                    initial_connections: clamp_worker_count(settings.upload_connections),
                     max_seconds: settings.upload_seconds,
                     progress_interval: settings.progress_interval,
+                    request_target_ms: 1_000,
+                    start_request_size: 1_048_576,
+                    min_request_size: 32 * 1024,
+                    max_request_size: 25 * 1024 * 1024,
                 };
                 let stats = upload::run_upload_test(
                     client,

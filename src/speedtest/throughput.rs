@@ -12,8 +12,19 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct TransferConfig {
     pub connections: usize,
+    pub initial_connections: usize,
     pub max_seconds: u64,
     pub progress_interval: Option<Duration>,
+    pub request_target_ms: u64,
+    pub start_request_size: usize,
+    pub min_request_size: usize,
+    pub max_request_size: usize,
+}
+
+impl TransferConfig {
+    pub fn initial_connections(&self) -> usize {
+        self.initial_connections.clamp(1, self.connections.max(1))
+    }
 }
 
 /// A time bucket accumulating transferred bytes over a sampling interval.
@@ -242,28 +253,30 @@ impl ThroughputCalculator {
         desired.clamp(1, max)
     }
 
-    /// Suggest request size targeting ~1s of data per connection.
+    /// Suggest request size targeting the configured request length per connection.
     ///
     /// Near the end of the test (`time_remaining_ms < 2000`), the target
     /// shrinks to avoid large in-flight requests that distort the final
     /// measurement.
-    pub fn suggested_request_size(&self, num_connections: usize, time_remaining_ms: u64) -> usize {
-        const MIN_SIZE: usize = 32 * 1024;
-        const MAX_SIZE: usize = 25 * 1024 * 1024;
-
+    pub fn suggested_request_size(
+        &self,
+        num_connections: usize,
+        time_remaining_ms: u64,
+        config: &TransferConfig,
+    ) -> usize {
         let speed_bps = self.compute_average();
         if speed_bps <= 0.0 || num_connections == 0 {
-            return MIN_SIZE;
+            return config.min_request_size;
         }
 
         let target_ms = if time_remaining_ms > 0 && time_remaining_ms < 2000 {
             (time_remaining_ms / 2).max(100) as f64
         } else {
-            1000.0
+            config.request_target_ms as f64
         };
 
         let size = (target_ms / 1000.0 * speed_bps / num_connections as f64) as usize;
-        size.clamp(MIN_SIZE, MAX_SIZE)
+        size.clamp(config.min_request_size, config.max_request_size)
     }
 
     fn compute_average(&self) -> f64 {
@@ -732,7 +745,7 @@ mod tests {
             calc.record_sample(t, t * 12_500);
         }
         // With 4 connections and 8s remaining: target 1s * 12.5MB/s / 4 ≈ 3.1MB
-        let size = calc.suggested_request_size(4, 8000);
+        let size = calc.suggested_request_size(4, 8000, &test_transfer_config());
         assert!(size > 2_000_000 && size < 5_000_000, "got {size}");
     }
 
@@ -743,8 +756,9 @@ mod tests {
             let t: u64 = step * 50;
             calc.record_sample(t, t * 12_500);
         }
-        let size_normal = calc.suggested_request_size(4, 8000);
-        let size_near_end = calc.suggested_request_size(4, 500);
+        let config = test_transfer_config();
+        let size_normal = calc.suggested_request_size(4, 8000, &config);
+        let size_near_end = calc.suggested_request_size(4, 500, &config);
         assert!(
             size_near_end < size_normal,
             "near-end ({size_near_end}) should be smaller than normal ({size_normal})"
@@ -754,7 +768,37 @@ mod tests {
     #[test]
     fn suggested_request_size_returns_min_with_no_speed() {
         let calc = ThroughputCalculator::new(10_000);
-        let size = calc.suggested_request_size(4, 8000);
+        let size = calc.suggested_request_size(4, 8000, &test_transfer_config());
         assert_eq!(size, 32 * 1024);
+    }
+
+    #[test]
+    fn suggested_request_size_honors_longer_download_target() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        for step in 0..=20 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 12_500);
+        }
+
+        let mut config = test_transfer_config();
+        config.request_target_ms = 5_000;
+        config.min_request_size = 25_000_000;
+        config.max_request_size = 250_000_000;
+
+        let size = calc.suggested_request_size(4, 8_000, &config);
+        assert_eq!(size, 25_000_000);
+    }
+
+    fn test_transfer_config() -> TransferConfig {
+        TransferConfig {
+            connections: 4,
+            initial_connections: 4,
+            max_seconds: 10,
+            progress_interval: None,
+            request_target_ms: 1_000,
+            start_request_size: 1_048_576,
+            min_request_size: 32 * 1024,
+            max_request_size: 25 * 1024 * 1024,
+        }
     }
 }
