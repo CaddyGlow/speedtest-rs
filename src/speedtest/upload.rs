@@ -17,9 +17,10 @@ use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{
-    ActiveConnectionGuard, TransferLoopState, TransferSample, drain_join_set, elapsed_ms_since,
-    new_transfer_control, normalize_server_pool, resolve_ready_server_pool, run_transfer_loop,
-    spawn_worker_range,
+    ActiveConnectionGuard, TransferLoopState, TransferSample, close_tcp_worker_stream,
+    drain_join_set, elapsed_ms_since, ensure_tcp_worker_stream, new_transfer_control,
+    normalize_server_pool, record_browser_request_error, reset_tcp_worker_stream,
+    resolve_ready_server_pool, run_transfer_loop, spawn_worker_range,
 };
 use crate::util::clamp_worker_count;
 
@@ -490,28 +491,20 @@ fn spawn_upload_worker_tcp(
                 break;
             }
 
-            if stream.is_none() {
-                let maybe_connected = tokio::select! {
-                    connected = modern_protocol::connect(&worker_server) => Some(connected),
-                    _ = worker_stop.changed() => None,
-                };
-
-                match maybe_connected {
-                    Some(Ok(connected)) => {
-                        stream = Some(connected);
-                        if !stream_connected {
-                            worker_active_connections.fetch_add(1, Ordering::Relaxed);
-                            stream_connected = true;
-                        }
-                    }
-                    Some(Err(_)) => {
-                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    None => {
-                        break;
-                    }
+            if !ensure_tcp_worker_stream(
+                &mut stream,
+                &mut stream_connected,
+                &mut worker_stop,
+                &worker_server,
+                &worker_active_connections,
+                &worker_transport_errors,
+            )
+            .await
+            {
+                if stream.is_none() {
+                    continue;
                 }
+                break;
             }
 
             worker_attempts.fetch_add(1, Ordering::Relaxed);
@@ -538,24 +531,18 @@ fn spawn_upload_worker_tcp(
                     worker_successes.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(Err(_)) => {
-                    worker_read_errors.fetch_add(1, Ordering::Relaxed);
-                    stream = None;
-                    if stream_connected {
-                        worker_active_connections.fetch_sub(1, Ordering::Relaxed);
-                        stream_connected = false;
-                    }
+                    reset_tcp_worker_stream(
+                        &mut stream,
+                        &mut stream_connected,
+                        &worker_active_connections,
+                        &worker_read_errors,
+                    );
                 }
                 None => break,
             }
         }
 
-        if let Some(mut active_stream) = stream {
-            let _ = modern_protocol::quit(&mut active_stream).await;
-        }
-
-        if stream_connected {
-            worker_active_connections.fetch_sub(1, Ordering::Relaxed);
-        }
+        close_tcp_worker_stream(stream, stream_connected, &worker_active_connections).await;
     });
 }
 
@@ -631,18 +618,12 @@ fn spawn_upload_worker_xhr(
                 Some(Ok(_)) => {
                     worker_successes.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(Err(error)) => match error {
-                    browser_protocol::TransferRequestError::HttpStatus => {
-                        worker_http_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    browser_protocol::TransferRequestError::Transport
-                    | browser_protocol::TransferRequestError::InvalidEndpoint => {
-                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    browser_protocol::TransferRequestError::ResponseRead => {
-                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                },
+                Some(Err(error)) => record_browser_request_error(
+                    &worker_http_errors,
+                    &worker_transport_errors,
+                    &worker_read_errors,
+                    error,
+                ),
                 None => break,
             }
         }

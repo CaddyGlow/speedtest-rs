@@ -2,13 +2,16 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinSet;
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+use crate::speedtest::browser_protocol::TransferRequestError;
+use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, TransferConfig};
 
@@ -264,5 +267,86 @@ where
 {
     for worker_index in range {
         spawn(worker_index, tasks);
+    }
+}
+
+pub async fn ensure_tcp_worker_stream(
+    stream: &mut Option<TcpStream>,
+    stream_connected: &mut bool,
+    stop_rx: &mut watch::Receiver<bool>,
+    server: &SpeedtestServer,
+    active_connections: &AtomicUsize,
+    transport_errors: &AtomicU64,
+) -> bool {
+    if stream.is_some() {
+        return true;
+    }
+
+    let maybe_connected = tokio::select! {
+        connected = modern_protocol::connect(server) => Some(connected),
+        _ = stop_rx.changed() => None,
+    };
+
+    match maybe_connected {
+        Some(Ok(connected)) => {
+            *stream = Some(connected);
+            if !*stream_connected {
+                active_connections.fetch_add(1, Ordering::Relaxed);
+                *stream_connected = true;
+            }
+            true
+        }
+        Some(Err(_)) => {
+            transport_errors.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        None => false,
+    }
+}
+
+pub fn reset_tcp_worker_stream(
+    stream: &mut Option<TcpStream>,
+    stream_connected: &mut bool,
+    active_connections: &AtomicUsize,
+    read_errors: &AtomicU64,
+) {
+    read_errors.fetch_add(1, Ordering::Relaxed);
+    *stream = None;
+    if *stream_connected {
+        active_connections.fetch_sub(1, Ordering::Relaxed);
+        *stream_connected = false;
+    }
+}
+
+pub async fn close_tcp_worker_stream(
+    stream: Option<TcpStream>,
+    stream_connected: bool,
+    active_connections: &AtomicUsize,
+) {
+    if let Some(mut active_stream) = stream {
+        let _ = modern_protocol::quit(&mut active_stream).await;
+    }
+
+    if stream_connected {
+        active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_browser_request_error(
+    http_errors: &AtomicU64,
+    transport_errors: &AtomicU64,
+    read_errors: &AtomicU64,
+    error: TransferRequestError,
+) {
+    match error {
+        TransferRequestError::HttpStatus => {
+            http_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        TransferRequestError::Transport | TransferRequestError::InvalidEndpoint => {
+            transport_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        TransferRequestError::ResponseRead => {
+            read_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
