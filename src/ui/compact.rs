@@ -25,8 +25,6 @@ pub struct SpeedProgressBar {
     bar: ProgressBar,
     sparkline_bar: ProgressBar,
     sparkline: RefCell<Sparkline>,
-    last_sample_bytes: Cell<u64>,
-    last_sample_elapsed_nanos: Cell<u128>,
     last_non_zero_mbps: Cell<f64>,
 }
 
@@ -105,8 +103,6 @@ impl CompactUi {
             bar,
             sparkline_bar,
             sparkline: RefCell::new(Sparkline::new(sparkline_width)),
-            last_sample_bytes: Cell::new(0),
-            last_sample_elapsed_nanos: Cell::new(0),
             last_non_zero_mbps: Cell::new(0.0),
         }
     }
@@ -115,13 +111,7 @@ impl CompactUi {
         let elapsed_secs = sample.elapsed.as_secs().min(progress.total_seconds);
         progress.bar.set_position(elapsed_secs);
         progress.bar.set_message(progress.phase.clone());
-        let mut mbps = estimate_interval_mbps(
-            sample.bytes,
-            sample.elapsed.as_nanos(),
-            progress.last_sample_bytes.get(),
-            progress.last_sample_elapsed_nanos.get(),
-            sample.mbps,
-        );
+        let mut mbps = sample.mbps;
         if !mbps.is_finite() {
             mbps = 0.0;
         }
@@ -132,10 +122,6 @@ impl CompactUi {
             progress.last_non_zero_mbps.set(mbps);
             mbps
         };
-        progress.last_sample_bytes.set(sample.bytes);
-        progress
-            .last_sample_elapsed_nanos
-            .set(sample.elapsed.as_nanos());
         progress.bar.set_prefix(format!(
             "{:7.2} Mbps {:.1} MB",
             mbps,
@@ -143,7 +129,7 @@ impl CompactUi {
         ));
 
         let mut sparkline = progress.sparkline.borrow_mut();
-        sparkline.push(mbps);
+        sparkline.push(sample.mbps);
         progress.sparkline_bar.set_message(sparkline.render());
     }
 
@@ -165,59 +151,5 @@ impl CompactUi {
             metric.bar.finish_and_clear();
         }
         self.phase.finish_and_clear();
-    }
-}
-
-fn estimate_interval_mbps(
-    current_bytes: u64,
-    current_elapsed_nanos: u128,
-    previous_bytes: u64,
-    previous_elapsed_nanos: u128,
-    fallback_mbps: f64,
-) -> f64 {
-    if current_elapsed_nanos <= previous_elapsed_nanos {
-        return fallback_mbps;
-    }
-
-    let elapsed_nanos = current_elapsed_nanos - previous_elapsed_nanos;
-    if elapsed_nanos == 0 {
-        return fallback_mbps;
-    }
-
-    if current_bytes < previous_bytes {
-        return fallback_mbps;
-    }
-
-    let delta_bytes = current_bytes - previous_bytes;
-    if delta_bytes == 0 {
-        return fallback_mbps;
-    }
-
-    let elapsed_seconds = elapsed_nanos as f64 / 1_000_000_000.0;
-    let mbps = (delta_bytes as f64 * 8.0) / elapsed_seconds / 1_000_000.0;
-
-    if mbps.is_finite() {
-        mbps
-    } else {
-        fallback_mbps
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::estimate_interval_mbps;
-
-    #[test]
-    fn estimate_interval_speed_uses_byte_delta() {
-        let fallback = 3.2;
-        let mbps = estimate_interval_mbps(1_000_000, 1_000_000_000, 200_000, 500_000_000, fallback);
-        assert!((mbps - 12.8).abs() < 0.0001);
-    }
-
-    #[test]
-    fn estimate_interval_speed_returns_fallback_without_progress() {
-        let fallback = 3.2;
-        let mbps = estimate_interval_mbps(500_000, 1_000_000_000, 500_000, 500_000_000, fallback);
-        assert!((mbps - fallback).abs() < 0.0001);
     }
 }

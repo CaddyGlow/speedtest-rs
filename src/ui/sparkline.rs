@@ -84,7 +84,6 @@ mod tests {
         let mut chars = s.chars();
         while let Some(c) = chars.next() {
             if c == '\x1b' {
-                // skip until 'm'
                 for c2 in chars.by_ref() {
                     if c2 == 'm' {
                         break;
@@ -150,8 +149,6 @@ mod tests {
             s.push(100.0);
         }
         let rendered = strip_ansi(&s.render());
-        // Without percentile scaling this would be █▁▁▁...
-        // With it, the bulk of samples should be mid-height or above, not all ▁
         let low_count = rendered.chars().filter(|&c| c == '▁').count();
         assert!(low_count <= 2, "too many low bars ({low_count}), outlier is squashing the graph");
     }
