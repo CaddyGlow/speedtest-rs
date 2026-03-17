@@ -21,6 +21,7 @@ const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STAGE_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const SERVER_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_READINESS_BYTES: usize = 64 * 1024;
+const DEFAULT_DOWNLOAD_SIZE: usize = 25_000_000;
 
 #[derive(Debug, Clone)]
 pub struct DownloadStats {
@@ -96,8 +97,11 @@ where
 
     let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
     let (first_transfer_tx, mut first_transfer_rx) = watch::channel(false);
+    let target_workers = Arc::new(AtomicUsize::new(worker_count));
+    let suggested_size = Arc::new(AtomicUsize::new(DEFAULT_DOWNLOAD_SIZE));
 
     let mut tasks = JoinSet::new();
+    let mut spawned_count = worker_count;
     match mode {
         TransportProtocol::Xhr => run_download_workers_modern_sdk(
             client,
@@ -112,6 +116,8 @@ where
             &response_read_errors,
             &active_connections,
             &per_server_bytes,
+            &target_workers,
+            &suggested_size,
             &stage_stop_rx,
             &first_transfer_tx,
             &mut tasks,
@@ -126,6 +132,8 @@ where
             &response_read_errors,
             &active_connections,
             &per_server_bytes,
+            &target_workers,
+            &suggested_size,
             &stage_stop_rx,
             &first_transfer_tx,
             &mut tasks,
@@ -173,6 +181,58 @@ where
                         let _ = stage_stop_tx.send(true);
                         break;
                     }
+
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    let desired = calc.desired_connections(config.connections);
+                    target_workers.store(desired, Ordering::Relaxed);
+                    if desired > spawned_count && !ready_pool.is_empty() {
+                        for idx in spawned_count..desired {
+                            match mode {
+                                TransportProtocol::Tcp => spawn_download_worker_tcp(
+                                    idx,
+                                    &ready_pool,
+                                    &total_bytes,
+                                    &request_attempts,
+                                    &request_successes,
+                                    &request_transport_errors,
+                                    &response_read_errors,
+                                    &active_connections,
+                                    &per_server_bytes,
+                                    &target_workers,
+                                    &suggested_size,
+                                    &stage_stop_rx,
+                                    &first_transfer_tx,
+                                    &mut tasks,
+                                ),
+                                TransportProtocol::Xhr => spawn_download_worker_xhr(
+                                    idx,
+                                    client,
+                                    &ready_pool,
+                                    &default_guid,
+                                    &total_bytes,
+                                    &request_attempts,
+                                    &request_successes,
+                                    &request_http_errors,
+                                    &request_transport_errors,
+                                    &response_read_errors,
+                                    &active_connections,
+                                    &per_server_bytes,
+                                    &target_workers,
+                                    &suggested_size,
+                                    &stage_stop_rx,
+                                    &first_transfer_tx,
+                                    &mut tasks,
+                                ),
+                            }
+                        }
+                        spawned_count = desired;
+                    }
+
+                    let time_remaining_ms =
+                        (config.max_seconds * 1000).saturating_sub(elapsed_ms);
+                    let conns = active_connections.load(Ordering::Relaxed).max(1);
+                    let size = calc.suggested_request_size(conns, time_remaining_ms);
+                    suggested_size.store(size, Ordering::Relaxed);
 
                     if let Some(interval) = config.progress_interval {
                         let should_report = last_progress_at
@@ -302,6 +362,8 @@ fn run_download_workers_modern(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     per_server_bytes: &Arc<Vec<AtomicU64>>,
+    target_workers: &Arc<AtomicUsize>,
+    suggested_size: &Arc<AtomicUsize>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -311,91 +373,132 @@ fn run_download_workers_modern(
     }
 
     for worker in 0..worker_count {
-        let server_index = worker % server_pool.len();
-        let worker_server = server_pool[server_index].clone();
-        let worker_bytes = Arc::clone(total_bytes);
-        let worker_attempts = Arc::clone(request_attempts);
-        let worker_successes = Arc::clone(request_successes);
-        let worker_transport_errors = Arc::clone(request_transport_errors);
-        let worker_read_errors = Arc::clone(response_read_errors);
-        let worker_active_connections = Arc::clone(active_connections);
-        let worker_per_server_bytes = Arc::clone(per_server_bytes);
-        let mut worker_stop = stop_rx.clone();
-        let worker_first_transfer_tx = first_transfer_tx.clone();
-        tasks.spawn(async move {
-            const REQUEST_SIZE: usize = 25_000_000;
-            let mut stream = None;
-            let mut stream_connected = false;
-            let mut signaled_first_transfer = false;
+        spawn_download_worker_tcp(
+            worker,
+            server_pool,
+            total_bytes,
+            request_attempts,
+            request_successes,
+            request_transport_errors,
+            response_read_errors,
+            active_connections,
+            per_server_bytes,
+            target_workers,
+            suggested_size,
+            stop_rx,
+            first_transfer_tx,
+            tasks,
+        );
+    }
+}
 
-            while !*worker_stop.borrow_and_update() {
-                if stream.is_none() {
-                    let maybe_connected = tokio::select! {
-                        connected = modern_protocol::connect(&worker_server) => Some(connected),
-                        _ = worker_stop.changed() => None,
-                    };
+#[allow(clippy::too_many_arguments)]
+fn spawn_download_worker_tcp(
+    worker_index: usize,
+    server_pool: &[SpeedtestServer],
+    total_bytes: &Arc<AtomicU64>,
+    request_attempts: &Arc<AtomicU64>,
+    request_successes: &Arc<AtomicU64>,
+    request_transport_errors: &Arc<AtomicU64>,
+    response_read_errors: &Arc<AtomicU64>,
+    active_connections: &Arc<AtomicUsize>,
+    per_server_bytes: &Arc<Vec<AtomicU64>>,
+    target_workers: &Arc<AtomicUsize>,
+    suggested_size: &Arc<AtomicUsize>,
+    stop_rx: &watch::Receiver<bool>,
+    first_transfer_tx: &watch::Sender<bool>,
+    tasks: &mut JoinSet<()>,
+) {
+    let server_index = worker_index % server_pool.len();
+    let worker_server = server_pool[server_index].clone();
+    let worker_bytes = Arc::clone(total_bytes);
+    let worker_attempts = Arc::clone(request_attempts);
+    let worker_successes = Arc::clone(request_successes);
+    let worker_transport_errors = Arc::clone(request_transport_errors);
+    let worker_read_errors = Arc::clone(response_read_errors);
+    let worker_active_connections = Arc::clone(active_connections);
+    let worker_per_server_bytes = Arc::clone(per_server_bytes);
+    let worker_target = Arc::clone(target_workers);
+    let worker_suggested_size = Arc::clone(suggested_size);
+    let mut worker_stop = stop_rx.clone();
+    let worker_first_transfer_tx = first_transfer_tx.clone();
+    tasks.spawn(async move {
+        let mut stream = None;
+        let mut stream_connected = false;
+        let mut signaled_first_transfer = false;
 
-                    match maybe_connected {
-                        Some(Ok(connected)) => {
-                            stream = Some(connected);
-                            if !stream_connected {
-                                worker_active_connections.fetch_add(1, Ordering::Relaxed);
-                                stream_connected = true;
-                            }
-                        }
-                        Some(Err(_)) => {
-                            worker_transport_errors.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                }
+        while !*worker_stop.borrow_and_update() {
+            if worker_index >= worker_target.load(Ordering::Relaxed) {
+                break;
+            }
 
-                worker_attempts.fetch_add(1, Ordering::Relaxed);
-
-                let Some(active_stream) = stream.as_mut() else {
-                    continue;
-                };
-
-                let maybe_downloaded = tokio::select! {
-                    downloaded = modern_protocol::download(active_stream, REQUEST_SIZE) => Some(downloaded),
+            if stream.is_none() {
+                let maybe_connected = tokio::select! {
+                    connected = modern_protocol::connect(&worker_server) => Some(connected),
                     _ = worker_stop.changed() => None,
                 };
 
-                match maybe_downloaded {
-                    Some(Ok(downloaded)) => {
-                        worker_successes.fetch_add(1, Ordering::Relaxed);
-                        worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
-                        worker_per_server_bytes[server_index]
-                            .fetch_add(downloaded, Ordering::Relaxed);
-                        if downloaded > 0 && !signaled_first_transfer {
-                            let _ = worker_first_transfer_tx.send(true);
-                            signaled_first_transfer = true;
+                match maybe_connected {
+                    Some(Ok(connected)) => {
+                        stream = Some(connected);
+                        if !stream_connected {
+                            worker_active_connections.fetch_add(1, Ordering::Relaxed);
+                            stream_connected = true;
                         }
                     }
                     Some(Err(_)) => {
-                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
-                        stream = None;
-                        if stream_connected {
-                            worker_active_connections.fetch_sub(1, Ordering::Relaxed);
-                            stream_connected = false;
-                        }
+                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    None => break,
+                    None => {
+                        break;
+                    }
                 }
             }
 
-            if let Some(mut active_stream) = stream {
-                let _ = modern_protocol::quit(&mut active_stream).await;
-            }
+            worker_attempts.fetch_add(1, Ordering::Relaxed);
 
-            if stream_connected {
-                worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+            let Some(active_stream) = stream.as_mut() else {
+                continue;
+            };
+
+            let request_size = worker_suggested_size.load(Ordering::Relaxed);
+            let maybe_downloaded = tokio::select! {
+                downloaded = modern_protocol::download(active_stream, request_size) => Some(downloaded),
+                _ = worker_stop.changed() => None,
+            };
+
+            match maybe_downloaded {
+                Some(Ok(downloaded)) => {
+                    worker_successes.fetch_add(1, Ordering::Relaxed);
+                    worker_bytes.fetch_add(downloaded, Ordering::Relaxed);
+                    worker_per_server_bytes[server_index]
+                        .fetch_add(downloaded, Ordering::Relaxed);
+                    if downloaded > 0 && !signaled_first_transfer {
+                        let _ = worker_first_transfer_tx.send(true);
+                        signaled_first_transfer = true;
+                    }
+                }
+                Some(Err(_)) => {
+                    worker_read_errors.fetch_add(1, Ordering::Relaxed);
+                    stream = None;
+                    if stream_connected {
+                        worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+                        stream_connected = false;
+                    }
+                }
+                None => break,
             }
-        });
-    }
+        }
+
+        if let Some(mut active_stream) = stream {
+            let _ = modern_protocol::quit(&mut active_stream).await;
+        }
+
+        if stream_connected {
+            worker_active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +515,8 @@ fn run_download_workers_modern_sdk(
     response_read_errors: &Arc<AtomicU64>,
     active_connections: &Arc<AtomicUsize>,
     per_server_bytes: &Arc<Vec<AtomicU64>>,
+    target_workers: &Arc<AtomicUsize>,
+    suggested_size: &Arc<AtomicUsize>,
     stop_rx: &watch::Receiver<bool>,
     first_transfer_tx: &watch::Sender<bool>,
     tasks: &mut JoinSet<()>,
@@ -421,71 +526,118 @@ fn run_download_workers_modern_sdk(
     }
 
     for worker in 0..worker_count {
-        let worker_client = client.clone();
-        let server_index = worker % server_pool.len();
-        let worker_server = server_pool[server_index].clone();
-        let worker_default_guid = default_guid.to_string();
-        let _worker_guid = worker_server
-            .session_guid
-            .clone()
-            .unwrap_or(worker_default_guid);
-        let worker_bytes = Arc::clone(total_bytes);
-        let worker_attempts = Arc::clone(request_attempts);
-        let worker_successes = Arc::clone(request_successes);
-        let worker_http_errors = Arc::clone(request_http_errors);
-        let worker_transport_errors = Arc::clone(request_transport_errors);
-        let worker_read_errors = Arc::clone(response_read_errors);
-        let worker_active_connections = Arc::clone(active_connections);
-        let worker_per_server_bytes = Arc::clone(per_server_bytes);
-        let mut worker_stop = stop_rx.clone();
-        let worker_first_transfer_tx = first_transfer_tx.clone();
-        tasks.spawn(async move {
-            const REQUEST_SIZE: usize = 25_000_000;
-            let mut signaled_first_transfer = false;
-
-            while !*worker_stop.borrow_and_update() {
-                worker_attempts.fetch_add(1, Ordering::Relaxed);
-
-                let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
-
-                let counters: [&AtomicU64; 2] =
-                    [&worker_bytes, &worker_per_server_bytes[server_index]];
-                let maybe_downloaded = tokio::select! {
-                    downloaded = browser_protocol::download_streaming(
-                        &worker_client,
-                        &worker_server,
-                        REQUEST_SIZE,
-                        &counters,
-                    ) => Some(downloaded),
-                    _ = worker_stop.changed() => None,
-                };
-
-                if !signaled_first_transfer && worker_bytes.load(Ordering::Relaxed) > 0 {
-                    let _ = worker_first_transfer_tx.send(true);
-                    signaled_first_transfer = true;
-                }
-
-                match maybe_downloaded {
-                    Some(Ok(_)) => {
-                        worker_successes.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some(Err(error)) => match error {
-                        browser_protocol::TransferRequestError::HttpStatus => {
-                            worker_http_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        browser_protocol::TransferRequestError::Transport
-                        | browser_protocol::TransferRequestError::InvalidEndpoint => {
-                            worker_transport_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        browser_protocol::TransferRequestError::ResponseRead => {
-                            worker_read_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    },
-                    None => break,
-                }
-            }
-        });
+        spawn_download_worker_xhr(
+            worker,
+            client,
+            server_pool,
+            default_guid,
+            total_bytes,
+            request_attempts,
+            request_successes,
+            request_http_errors,
+            request_transport_errors,
+            response_read_errors,
+            active_connections,
+            per_server_bytes,
+            target_workers,
+            suggested_size,
+            stop_rx,
+            first_transfer_tx,
+            tasks,
+        );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_download_worker_xhr(
+    worker_index: usize,
+    client: &Client,
+    server_pool: &[SpeedtestServer],
+    default_guid: &str,
+    total_bytes: &Arc<AtomicU64>,
+    request_attempts: &Arc<AtomicU64>,
+    request_successes: &Arc<AtomicU64>,
+    request_http_errors: &Arc<AtomicU64>,
+    request_transport_errors: &Arc<AtomicU64>,
+    response_read_errors: &Arc<AtomicU64>,
+    active_connections: &Arc<AtomicUsize>,
+    per_server_bytes: &Arc<Vec<AtomicU64>>,
+    target_workers: &Arc<AtomicUsize>,
+    suggested_size: &Arc<AtomicUsize>,
+    stop_rx: &watch::Receiver<bool>,
+    first_transfer_tx: &watch::Sender<bool>,
+    tasks: &mut JoinSet<()>,
+) {
+    let worker_client = client.clone();
+    let server_index = worker_index % server_pool.len();
+    let worker_server = server_pool[server_index].clone();
+    let worker_default_guid = default_guid.to_string();
+    let _worker_guid = worker_server
+        .session_guid
+        .clone()
+        .unwrap_or(worker_default_guid);
+    let worker_bytes = Arc::clone(total_bytes);
+    let worker_attempts = Arc::clone(request_attempts);
+    let worker_successes = Arc::clone(request_successes);
+    let worker_http_errors = Arc::clone(request_http_errors);
+    let worker_transport_errors = Arc::clone(request_transport_errors);
+    let worker_read_errors = Arc::clone(response_read_errors);
+    let worker_active_connections = Arc::clone(active_connections);
+    let worker_per_server_bytes = Arc::clone(per_server_bytes);
+    let worker_target = Arc::clone(target_workers);
+    let worker_suggested_size = Arc::clone(suggested_size);
+    let mut worker_stop = stop_rx.clone();
+    let worker_first_transfer_tx = first_transfer_tx.clone();
+    tasks.spawn(async move {
+        let mut signaled_first_transfer = false;
+
+        while !*worker_stop.borrow_and_update() {
+            if worker_index >= worker_target.load(Ordering::Relaxed) {
+                break;
+            }
+
+            worker_attempts.fetch_add(1, Ordering::Relaxed);
+
+            let _active_guard = ActiveConnectionGuard::new(&worker_active_connections);
+
+            let request_size = worker_suggested_size.load(Ordering::Relaxed);
+            let counters: [&AtomicU64; 2] =
+                [&worker_bytes, &worker_per_server_bytes[server_index]];
+            let maybe_downloaded = tokio::select! {
+                downloaded = browser_protocol::download_streaming(
+                    &worker_client,
+                    &worker_server,
+                    request_size,
+                    &counters,
+                ) => Some(downloaded),
+                _ = worker_stop.changed() => None,
+            };
+
+            if !signaled_first_transfer && worker_bytes.load(Ordering::Relaxed) > 0 {
+                let _ = worker_first_transfer_tx.send(true);
+                signaled_first_transfer = true;
+            }
+
+            match maybe_downloaded {
+                Some(Ok(_)) => {
+                    worker_successes.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Err(error)) => match error {
+                    browser_protocol::TransferRequestError::HttpStatus => {
+                        worker_http_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    browser_protocol::TransferRequestError::Transport
+                    | browser_protocol::TransferRequestError::InvalidEndpoint => {
+                        worker_transport_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    browser_protocol::TransferRequestError::ResponseRead => {
+                        worker_read_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                None => break,
+            }
+        }
+    });
 }
 
 #[cfg(test)]

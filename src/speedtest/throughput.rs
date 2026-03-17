@@ -134,6 +134,7 @@ pub struct ThroughputCalculator {
     stream_750: BucketStream,
     last_elapsed_ms: u64,
     last_cumulative_bytes: u64,
+    locked_connections: Option<usize>,
 }
 
 impl ThroughputCalculator {
@@ -145,6 +146,7 @@ impl ThroughputCalculator {
             stream_750: BucketStream::new(750),
             last_elapsed_ms: 0,
             last_cumulative_bytes: 0,
+            locked_connections: None,
         }
     }
 
@@ -214,6 +216,55 @@ impl ThroughputCalculator {
         let cv = variance.sqrt() / mean;
 
         cv < 0.05
+    }
+
+    /// Compute desired number of connections based on current throughput.
+    ///
+    /// Formula: `min(max, round(speed_mbps / 6))`. Connection count is
+    /// locked (frozen) once 50% of the configured test duration has elapsed.
+    pub fn desired_connections(&mut self, max: usize) -> usize {
+        if let Some(locked) = self.locked_connections {
+            return locked;
+        }
+
+        let desired = self.compute_desired_connections(max);
+
+        if self.last_elapsed_ms >= self.duration_ms / 2 {
+            self.locked_connections = Some(desired);
+        }
+
+        desired
+    }
+
+    fn compute_desired_connections(&self, max: usize) -> usize {
+        let speed_bps = self.compute_average();
+        let speed_mbps = speed_bps * 8.0 / 1_000_000.0;
+        let desired = (speed_mbps / 6.0).round() as usize;
+        desired.clamp(1, max)
+    }
+
+    /// Suggest request size targeting ~1s of data per connection.
+    ///
+    /// Near the end of the test (`time_remaining_ms < 2000`), the target
+    /// shrinks to avoid large in-flight requests that distort the final
+    /// measurement.
+    pub fn suggested_request_size(&self, num_connections: usize, time_remaining_ms: u64) -> usize {
+        const MIN_SIZE: usize = 32 * 1024;
+        const MAX_SIZE: usize = 25 * 1024 * 1024;
+
+        let speed_bps = self.compute_average();
+        if speed_bps <= 0.0 || num_connections == 0 {
+            return MIN_SIZE;
+        }
+
+        let target_ms = if time_remaining_ms > 0 && time_remaining_ms < 2000 {
+            (time_remaining_ms / 2).max(100) as f64
+        } else {
+            1000.0
+        };
+
+        let size = (target_ms / 1000.0 * speed_bps / num_connections as f64) as usize;
+        size.clamp(MIN_SIZE, MAX_SIZE)
     }
 
     fn compute_average(&self) -> f64 {
@@ -632,5 +683,79 @@ mod tests {
         assert!((result.average_mbps() - 1000.0).abs() < 0.01);
         assert!((result.mst_mbps() - 1040.0).abs() < 0.01);
         assert!((result.blended_mbps() - 1032.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn desired_connections_scales_with_speed() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        // Feed 1s of data at 12Mbps = 1_500_000 bytes/s
+        for step in 0..=20 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 1_500);
+        }
+        // 12Mbps / 6Mbps = 2
+        let desired = calc.desired_connections(16);
+        assert_eq!(desired, 2);
+    }
+
+    #[test]
+    fn desired_connections_locks_after_half_elapsed() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        // Feed 6s of data
+        for step in 0..=120 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 1_500);
+        }
+        // After 60% elapsed, connections should lock
+        let locked = calc.desired_connections(16);
+        // Change speed dramatically — shouldn't matter, it's locked
+        calc.record_sample(7000, 7000 * 100_000);
+        assert_eq!(calc.desired_connections(16), locked);
+    }
+
+    #[test]
+    fn desired_connections_clamps_to_max() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        // Feed very high speed: 1Gbps = 125_000_000 B/s
+        for step in 0..=20 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 125_000_000);
+        }
+        assert_eq!(calc.desired_connections(8), 8);
+    }
+
+    #[test]
+    fn suggested_request_size_scales_with_speed() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        // Feed 100Mbps = 12_500_000 B/s for 1s
+        for step in 0..=20 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 12_500);
+        }
+        // With 4 connections and 8s remaining: target 1s * 12.5MB/s / 4 ≈ 3.1MB
+        let size = calc.suggested_request_size(4, 8000);
+        assert!(size > 2_000_000 && size < 5_000_000, "got {size}");
+    }
+
+    #[test]
+    fn suggested_request_size_shrinks_near_end() {
+        let mut calc = ThroughputCalculator::new(10_000);
+        for step in 0..=20 {
+            let t: u64 = step * 50;
+            calc.record_sample(t, t * 12_500);
+        }
+        let size_normal = calc.suggested_request_size(4, 8000);
+        let size_near_end = calc.suggested_request_size(4, 500);
+        assert!(
+            size_near_end < size_normal,
+            "near-end ({size_near_end}) should be smaller than normal ({size_normal})"
+        );
+    }
+
+    #[test]
+    fn suggested_request_size_returns_min_with_no_speed() {
+        let calc = ThroughputCalculator::new(10_000);
+        let size = calc.suggested_request_size(4, 8000);
+        assert_eq!(size, 32 * 1024);
     }
 }
