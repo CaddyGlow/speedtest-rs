@@ -389,6 +389,9 @@ where
     }
 
     let throughput_result = calc.finish();
+    let actual_duration_ms = progress_clock_start
+        .map(|start| Instant::now().saturating_duration_since(start).as_millis() as u64)
+        .unwrap_or(0);
 
     let min_remote_elapsed_ms = config.max_seconds.saturating_mul(800);
     let remote_final_sample = remote_samples
@@ -424,7 +427,7 @@ where
     Ok(UploadStats {
         bytes,
         mbps,
-        actual_duration_ms: throughput_result.elapsed_ms,
+        actual_duration_ms,
         throughput: Some(throughput_result),
         request_attempts: request_attempts.load(Ordering::Relaxed),
         request_successes: request_successes.load(Ordering::Relaxed),

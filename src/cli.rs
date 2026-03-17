@@ -74,11 +74,11 @@ pub struct RunArgs {
     pub upload_connections: usize,
 
     /// Download phase duration in seconds
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_u64)]
+    #[arg(long, default_value_t = 15, value_parser = parse_positive_u64)]
     pub download_seconds: u64,
 
     /// Upload phase duration in seconds
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_u64)]
+    #[arg(long, default_value_t = 15, value_parser = parse_positive_u64)]
     pub upload_seconds: u64,
 
     /// Minimum seconds before early exit is allowed (0 disables early exit)
@@ -222,8 +222,8 @@ impl Default for Cli {
                 latency_samples: 10,
                 download_connections: 8,
                 upload_connections: 8,
-                download_seconds: 10,
-                upload_seconds: 10,
+                download_seconds: 15,
+                upload_seconds: 15,
                 min_seconds: 5,
                 download_only: false,
                 upload_only: false,

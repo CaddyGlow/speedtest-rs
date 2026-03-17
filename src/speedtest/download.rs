@@ -265,6 +265,9 @@ where
     }
 
     let throughput_result = calc.finish();
+    let actual_duration_ms = progress_clock_start
+        .map(|start| Instant::now().saturating_duration_since(start).as_millis() as u64)
+        .unwrap_or(0);
     let bytes = total_bytes.load(Ordering::Relaxed);
     let per_server = ready_pool
         .iter()
@@ -282,7 +285,7 @@ where
     Ok(DownloadStats {
         bytes,
         mbps: throughput_result.blended_mbps(),
-        actual_duration_ms: throughput_result.elapsed_ms,
+        actual_duration_ms,
         throughput: Some(throughput_result),
         request_attempts: request_attempts.load(Ordering::Relaxed),
         request_successes: request_successes.load(Ordering::Relaxed),
