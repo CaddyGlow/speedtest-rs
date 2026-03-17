@@ -1550,6 +1550,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "console",
  "futures-util",
  "indicatif",
  "md5",

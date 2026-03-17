@@ -1,4 +1,5 @@
 pub mod compact;
+pub mod sparkline;
 
 use std::time::Duration;
 

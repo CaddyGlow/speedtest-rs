@@ -1,8 +1,10 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
+use crate::ui::sparkline::Sparkline;
 use crate::ui::SpeedProgressSample;
 
 struct MetricLine {
@@ -21,6 +23,8 @@ pub struct SpeedProgressBar {
     phase: String,
     total_seconds: u64,
     bar: ProgressBar,
+    sparkline_bar: ProgressBar,
+    sparkline: RefCell<Sparkline>,
     last_sample_bytes: Cell<u64>,
     last_sample_elapsed_nanos: Cell<u128>,
     last_non_zero_mbps: Cell<f64>,
@@ -86,10 +90,21 @@ impl CompactUi {
         bar.enable_steady_tick(Duration::from_millis(120));
         bar.set_message(phase.to_string());
 
+        let term_width = console::Term::stdout().size().1 as usize;
+        let sparkline_width = term_width.saturating_sub(2).clamp(20, 60);
+
+        let sparkline_bar = self.multi.insert_after(&bar, ProgressBar::new_spinner());
+        sparkline_bar.set_style(
+            ProgressStyle::with_template("  {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+
         SpeedProgressBar {
             phase: phase.to_string(),
             total_seconds,
             bar,
+            sparkline_bar,
+            sparkline: RefCell::new(Sparkline::new(sparkline_width)),
             last_sample_bytes: Cell::new(0),
             last_sample_elapsed_nanos: Cell::new(0),
             last_non_zero_mbps: Cell::new(0.0),
@@ -126,6 +141,10 @@ impl CompactUi {
             mbps,
             sample.bytes as f64 / 1_000_000.0,
         ));
+
+        let mut sparkline = progress.sparkline.borrow_mut();
+        sparkline.push(mbps);
+        progress.sparkline_bar.set_message(sparkline.render());
     }
 
     pub fn finish_speed_progress(&self, progress: SpeedProgressBar, mbps: f64, bytes: u64) {
@@ -136,6 +155,9 @@ impl CompactUi {
             progress.phase,
             bytes as f64 / 1_000_000.0
         ));
+        progress
+            .sparkline_bar
+            .finish_with_message(progress.sparkline.borrow().render());
     }
 
     pub fn shutdown(&mut self) {
