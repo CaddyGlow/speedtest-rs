@@ -15,8 +15,9 @@ use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
+use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{ActiveConnectionGuard, normalize_server_pool};
-use crate::util::{clamp_worker_count, mbps_from_bytes};
+use crate::util::clamp_worker_count;
 
 const REMOTE_STATS_SAMPLE_INTERVAL_MS: u64 = 250;
 const REMOTE_STATS_JOIN_WAIT_MS: u64 = 3_500;
@@ -31,6 +32,8 @@ const UPLOAD_READINESS_BYTES: usize = 32 * 1024;
 pub struct UploadStats {
     pub bytes: u64,
     pub mbps: f64,
+    pub actual_duration_ms: u64,
+    pub throughput: Option<ThroughputResult>,
     pub request_attempts: u64,
     pub request_successes: u64,
     pub request_http_errors: u64,
@@ -47,21 +50,18 @@ pub struct UploadProgress {
     pub active_connections: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_upload_test<F>(
     client: &Client,
     selected_server: &SpeedtestServer,
     mode: TransportProtocol,
     server_pool: &[SpeedtestServer],
-    connections: usize,
-    seconds: u64,
-    progress_interval: Option<Duration>,
+    config: &TransferConfig,
     mut on_progress: F,
 ) -> Result<UploadStats>
 where
     F: FnMut(UploadProgress),
 {
-    let worker_count = clamp_worker_count(connections);
+    let worker_count = clamp_worker_count(config.connections);
     let total_bytes = Arc::new(AtomicU64::new(0));
     let request_attempts = Arc::new(AtomicU64::new(0));
     let request_successes = Arc::new(AtomicU64::new(0));
@@ -88,7 +88,7 @@ where
         .any(|server| server.id == selected_server.id);
 
     let start_at = Instant::now();
-    let mut stage_end_at = start_at + Duration::from_secs(seconds);
+    let mut stage_end_at = start_at + Duration::from_secs(config.max_seconds);
     let mut upload_stats_task = None;
     let mut remote_stats_background_task = None;
     let mut remote_stats_background_stop = None;
@@ -108,7 +108,7 @@ where
         debug!(
             server_id = selected_server.id,
             guid = %guid,
-            duration_seconds = seconds,
+            duration_seconds = config.max_seconds,
             sample_interval_ms = REMOTE_STATS_SAMPLE_INTERVAL_MS,
             "upload remote stats stream enabled"
         );
@@ -116,11 +116,12 @@ where
         let stats_server = selected_server.clone();
         let stats_guid = guid.clone();
         let ws_sender = tx.clone();
+        let stats_duration_seconds = config.max_seconds;
         upload_stats_task = Some(tokio::spawn(async move {
             browser_protocol::stream_upload_stats_samples(
                 &stats_server,
                 &stats_guid,
-                seconds,
+                stats_duration_seconds,
                 REMOTE_STATS_SAMPLE_INTERVAL_MS,
                 ws_sender,
             )
@@ -184,15 +185,18 @@ where
         }
     }
 
-    let poll_interval = progress_interval.unwrap_or(STAGE_POLL_INTERVAL);
+    let poll_interval = STAGE_POLL_INTERVAL;
+    let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
+    let min_duration_ms = config.min_seconds * 1000;
     let mut progress_clock_start = None;
     let mut transfer_started = false;
+    let mut last_progress_at: Option<Instant> = None;
 
     loop {
         if !transfer_started && *first_transfer_rx.borrow() {
             let now = Instant::now();
             transfer_started = true;
-            stage_end_at = now + Duration::from_secs(seconds);
+            stage_end_at = now + Duration::from_secs(config.max_seconds);
             progress_clock_start = Some(now);
         }
 
@@ -213,7 +217,7 @@ where
                 }
             }
             _ = sleep(poll_interval) => {
-                if progress_interval.is_some() {
+                if let Some(clock_start) = progress_clock_start {
                     if let Some(rx) = upload_stats_rx.as_mut() {
                         while let Ok(sample) = rx.try_recv() {
                             latest_remote_sample = Some(sample);
@@ -223,22 +227,31 @@ where
 
                     let now = Instant::now();
                     let local_bytes = total_bytes.load(Ordering::Relaxed);
-                    let elapsed = progress_clock_start
-                        .map(|clock_start| now.saturating_duration_since(clock_start))
-                        .unwrap_or_default();
-                    let elapsed_secs = elapsed.as_secs().max(1);
-                    let local_mbps = mbps_from_bytes(local_bytes, elapsed_secs);
+                    let elapsed = now.saturating_duration_since(clock_start);
+                    let blended_bps = calc.record_sample(elapsed.as_millis() as u64, local_bytes);
 
                     if let Some(sample) = latest_remote_sample {
                         let _ = remote_sample_rate(sample, elapsed);
                     }
 
-                    on_progress(UploadProgress {
-                        elapsed,
-                        bytes: local_bytes,
-                        mbps: local_mbps,
-                        active_connections: active_connections.load(Ordering::Relaxed),
-                    });
+                    if min_duration_ms > 0 && calc.should_stop_early(min_duration_ms) {
+                        let _ = stage_stop_tx.send(true);
+                        break;
+                    }
+
+                    if let Some(interval) = config.progress_interval {
+                        let should_report = last_progress_at
+                            .map_or(true, |t| now.duration_since(t) >= interval);
+                        if should_report {
+                            last_progress_at = Some(now);
+                            on_progress(UploadProgress {
+                                elapsed,
+                                bytes: local_bytes,
+                                mbps: blended_bps * 8.0 / 1_000_000.0,
+                                active_connections: active_connections.load(Ordering::Relaxed),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -316,7 +329,9 @@ where
         let _ = timeout(Duration::from_millis(900), &mut background_task).await;
     }
 
-    let min_remote_elapsed_ms = seconds.saturating_mul(800);
+    let throughput_result = calc.finish();
+
+    let min_remote_elapsed_ms = config.max_seconds.saturating_mul(800);
     let remote_final_sample = remote_samples
         .iter()
         .copied()
@@ -324,7 +339,7 @@ where
         .filter(|sample| sample.elapsed_ms >= min_remote_elapsed_ms);
 
     let local_bytes = total_bytes.load(Ordering::Relaxed);
-    let local_mbps = mbps_from_bytes(local_bytes, seconds);
+    let local_mbps = throughput_result.blended_mbps();
 
     let (bytes, mbps) = if let Some(sample) = remote_final_sample {
         let elapsed_secs = (sample.elapsed_ms.max(1) as f64) / 1_000.0;
@@ -350,6 +365,8 @@ where
     Ok(UploadStats {
         bytes,
         mbps,
+        actual_duration_ms: throughput_result.elapsed_ms,
+        throughput: Some(throughput_result),
         request_attempts: request_attempts.load(Ordering::Relaxed),
         request_successes: request_successes.load(Ordering::Relaxed),
         request_http_errors: request_http_errors.load(Ordering::Relaxed),
@@ -794,6 +811,12 @@ mod tests {
         let client = reqwest::Client::new();
         let start = Instant::now();
 
+        let test_config = crate::speedtest::throughput::TransferConfig {
+            connections: 1,
+            max_seconds: 1,
+            min_seconds: 0,
+            progress_interval: None,
+        };
         let result = timeout(
             Duration::from_secs(3),
             run_upload_test(
@@ -801,9 +824,7 @@ mod tests {
                 &server,
                 TransportProtocol::Tcp,
                 std::slice::from_ref(&server),
-                1,
-                1,
-                None,
+                &test_config,
                 |_| {},
             ),
         )

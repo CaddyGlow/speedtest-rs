@@ -13,6 +13,7 @@ use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
+use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{ActiveConnectionGuard, normalize_server_pool};
 use crate::util::{clamp_worker_count, mbps_from_bytes};
 
@@ -25,6 +26,8 @@ const DOWNLOAD_READINESS_BYTES: usize = 64 * 1024;
 pub struct DownloadStats {
     pub bytes: u64,
     pub mbps: f64,
+    pub actual_duration_ms: u64,
+    pub throughput: Option<ThroughputResult>,
     pub request_attempts: u64,
     pub request_successes: u64,
     pub request_http_errors: u64,
@@ -48,21 +51,18 @@ pub struct DownloadProgress {
     pub active_connections: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_download_test<F>(
     client: &Client,
     selected_server: &SpeedtestServer,
     mode: TransportProtocol,
     server_pool: &[SpeedtestServer],
-    connections: usize,
-    seconds: u64,
-    progress_interval: Option<Duration>,
+    config: &TransferConfig,
     mut on_progress: F,
 ) -> Result<DownloadStats>
 where
     F: FnMut(DownloadProgress),
 {
-    let worker_count = clamp_worker_count(connections);
+    let worker_count = clamp_worker_count(config.connections);
     let total_bytes = Arc::new(AtomicU64::new(0));
     let request_attempts = Arc::new(AtomicU64::new(0));
     let request_successes = Arc::new(AtomicU64::new(0));
@@ -86,7 +86,7 @@ where
     }
 
     let start_at = Instant::now();
-    let mut stage_end_at = start_at + Duration::from_secs(seconds);
+    let mut stage_end_at = start_at + Duration::from_secs(config.max_seconds);
     let per_server_bytes = Arc::new(
         ready_pool
             .iter()
@@ -132,14 +132,17 @@ where
         ),
     }
 
-    let poll_interval = progress_interval.unwrap_or(STAGE_POLL_INTERVAL);
+    let poll_interval = STAGE_POLL_INTERVAL;
+    let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
+    let min_duration_ms = config.min_seconds * 1000;
     let mut progress_clock_start = None;
     let mut transfer_started = false;
+    let mut last_progress_at: Option<Instant> = None;
     loop {
         if !transfer_started && *first_transfer_rx.borrow() {
             let now = Instant::now();
             transfer_started = true;
-            stage_end_at = now + Duration::from_secs(seconds);
+            stage_end_at = now + Duration::from_secs(config.max_seconds);
             progress_clock_start = Some(now);
         }
 
@@ -160,19 +163,30 @@ where
                 }
             }
             _ = sleep(poll_interval) => {
-                if progress_interval.is_some() {
+                if let Some(clock_start) = progress_clock_start {
                     let now = Instant::now();
                     let bytes = total_bytes.load(Ordering::Relaxed);
-                    let elapsed = progress_clock_start
-                        .map(|clock_start| now.saturating_duration_since(clock_start))
-                        .unwrap_or_default();
-                    let elapsed_secs = elapsed.as_secs().max(1);
-                    on_progress(DownloadProgress {
-                        elapsed,
-                        bytes,
-                        mbps: mbps_from_bytes(bytes, elapsed_secs),
-                        active_connections: active_connections.load(Ordering::Relaxed),
-                    });
+                    let elapsed = now.saturating_duration_since(clock_start);
+                    let blended_bps = calc.record_sample(elapsed.as_millis() as u64, bytes);
+
+                    if min_duration_ms > 0 && calc.should_stop_early(min_duration_ms) {
+                        let _ = stage_stop_tx.send(true);
+                        break;
+                    }
+
+                    if let Some(interval) = config.progress_interval {
+                        let should_report = last_progress_at
+                            .map_or(true, |t| now.duration_since(t) >= interval);
+                        if should_report {
+                            last_progress_at = Some(now);
+                            on_progress(DownloadProgress {
+                                elapsed,
+                                bytes,
+                                mbps: blended_bps * 8.0 / 1_000_000.0,
+                                active_connections: active_connections.load(Ordering::Relaxed),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -190,6 +204,7 @@ where
         .await;
     }
 
+    let throughput_result = calc.finish();
     let bytes = total_bytes.load(Ordering::Relaxed);
     let per_server = ready_pool
         .iter()
@@ -199,14 +214,16 @@ where
             PerServerDownloadStats {
                 server_id: server.id,
                 bytes,
-                mbps: mbps_from_bytes(bytes, seconds),
+                mbps: mbps_from_bytes(bytes, config.max_seconds),
             }
         })
         .collect();
 
     Ok(DownloadStats {
         bytes,
-        mbps: mbps_from_bytes(bytes, seconds),
+        mbps: throughput_result.blended_mbps(),
+        actual_duration_ms: throughput_result.elapsed_ms,
+        throughput: Some(throughput_result),
         request_attempts: request_attempts.load(Ordering::Relaxed),
         request_successes: request_successes.load(Ordering::Relaxed),
         request_http_errors: request_http_errors.load(Ordering::Relaxed),
@@ -594,6 +611,12 @@ mod tests {
         let client = reqwest::Client::new();
         let start = Instant::now();
 
+        let test_config = crate::speedtest::throughput::TransferConfig {
+            connections: 1,
+            max_seconds: 1,
+            min_seconds: 0,
+            progress_interval: None,
+        };
         let result = timeout(
             Duration::from_secs(3),
             run_download_test(
@@ -601,9 +624,7 @@ mod tests {
                 &server,
                 TransportProtocol::Tcp,
                 std::slice::from_ref(&server),
-                1,
-                1,
-                None,
+                &test_config,
                 |_| {},
             ),
         )

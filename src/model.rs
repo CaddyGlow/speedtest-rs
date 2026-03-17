@@ -57,6 +57,12 @@ pub struct BenchmarkResult {
     pub bytes: u64,
     pub duration_seconds: u64,
     pub connections: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_duration_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_mbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mst_mbps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +70,24 @@ pub struct ThroughputInterval {
     pub elapsed_seconds: f64,
     pub bytes: u64,
     pub mbps: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MstSpeedsOut {
+    pub average: f64,
+    pub mst_66_20: f64,
+    pub mst_66_30: f64,
+    pub mst_75_30: f64,
+    pub blended: f64,
+    pub superspeed: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MstBucketOut {
+    pub start_ms: u64,
+    pub stop_ms: u64,
+    pub bytes: u64,
+    pub bandwidth_mbps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +100,10 @@ pub struct DirectionDetails {
     pub intervals: Vec<ThroughputInterval>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_intervals: Option<Vec<ThroughputInterval>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mst_speeds: Option<MstSpeedsOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mst_buckets: Option<Vec<MstBucketOut>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

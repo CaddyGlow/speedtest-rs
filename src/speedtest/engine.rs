@@ -10,8 +10,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::model::{
-    BenchmarkResult, ClientMeta, DirectionDetails, RunDetails, RunResult,
-    SelectedServerLatencyDetails, Server, ThroughputInterval,
+    BenchmarkResult, ClientMeta, DirectionDetails, MstBucketOut, MstSpeedsOut, RunDetails,
+    RunResult, SelectedServerLatencyDetails, Server, ThroughputInterval,
 };
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::config::SpeedtestConfig;
@@ -19,6 +19,7 @@ use crate::speedtest::download::{self, DownloadProgress};
 use crate::speedtest::sdk_payload;
 use crate::speedtest::select::{self, LatencyMeasurement, ServerLatency};
 use crate::speedtest::servers::SpeedtestServer;
+use crate::speedtest::throughput::TransferConfig;
 use crate::speedtest::upload::{self, UploadProgress};
 use crate::util::clamp_worker_count;
 
@@ -80,6 +81,7 @@ pub struct EngineSettings {
     pub upload_connections: usize,
     pub download_seconds: u64,
     pub upload_seconds: u64,
+    pub min_seconds: u64,
     pub download_only: bool,
     pub upload_only: bool,
     pub details: bool,
@@ -97,6 +99,7 @@ impl Default for EngineSettings {
             upload_connections: 8,
             download_seconds: 10,
             upload_seconds: 10,
+            min_seconds: 5,
             download_only: false,
             upload_only: false,
             details: false,
@@ -289,14 +292,18 @@ where
                     .await
                 });
 
+                let download_config = TransferConfig {
+                    connections: clamp_worker_count(settings.download_connections),
+                    max_seconds: settings.download_seconds,
+                    min_seconds: settings.min_seconds,
+                    progress_interval: settings.progress_interval,
+                };
                 let stats = download::run_download_test(
                     client,
                     &selection.selected.server,
                     mode,
                     &selection.transfer_pool,
-                    clamp_worker_count(settings.download_connections),
-                    settings.download_seconds,
-                    settings.progress_interval,
+                    &download_config,
                     |snapshot: DownloadProgress| {
                         on_event(EngineEvent::StageProgress {
                             stage: EngineStage::Download,
@@ -340,12 +347,34 @@ where
                     mbps: stats.mbps,
                     bytes: stats.bytes,
                     duration_seconds: settings.download_seconds,
-                    connections: clamp_worker_count(settings.download_connections),
+                    connections: download_config.connections,
+                    actual_duration_seconds: Some(stats.actual_duration_ms as f64 / 1_000.0),
+                    average_mbps: stats.throughput.as_ref().map(|t| t.average_mbps()),
+                    mst_mbps: stats.throughput.as_ref().map(|t| t.mst_mbps()),
                 });
                 result.sdk_download_intervals =
                     (!intervals.is_empty()).then_some(intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
+                    let mst_speeds = stats.throughput.as_ref().map(|t| MstSpeedsOut {
+                        average: t.average_bps * 8.0 / 1_000_000.0,
+                        mst_66_20: t.mst_66_20_bps * 8.0 / 1_000_000.0,
+                        mst_66_30: t.mst_66_30_bps * 8.0 / 1_000_000.0,
+                        mst_75_30: t.mst_75_30_bps * 8.0 / 1_000_000.0,
+                        blended: t.blended_bps * 8.0 / 1_000_000.0,
+                        superspeed: t.superspeed_bps * 8.0 / 1_000_000.0,
+                    });
+                    let mst_buckets = stats.throughput.as_ref().map(|t| {
+                        t.buckets_500ms
+                            .iter()
+                            .map(|b| MstBucketOut {
+                                start_ms: b.start_ms,
+                                stop_ms: b.stop_ms,
+                                bytes: b.bytes,
+                                bandwidth_mbps: b.bandwidth_bytes_per_sec() * 8.0 / 1_000_000.0,
+                            })
+                            .collect()
+                    });
                     details.download = Some(DirectionDetails {
                         request_attempts: stats.request_attempts,
                         request_successes: stats.request_successes,
@@ -354,6 +383,8 @@ where
                         response_read_errors: stats.response_read_errors,
                         intervals,
                         remote_intervals: None,
+                        mst_speeds,
+                        mst_buckets,
                     });
                 }
 
@@ -393,14 +424,18 @@ where
                     .await
                 });
 
+                let upload_config = TransferConfig {
+                    connections: clamp_worker_count(settings.upload_connections),
+                    max_seconds: settings.upload_seconds,
+                    min_seconds: settings.min_seconds,
+                    progress_interval: settings.progress_interval,
+                };
                 let stats = upload::run_upload_test(
                     client,
                     &selection.selected.server,
                     mode,
                     &selection.transfer_pool,
-                    clamp_worker_count(settings.upload_connections),
-                    settings.upload_seconds,
-                    settings.progress_interval,
+                    &upload_config,
                     |snapshot: UploadProgress| {
                         on_event(EngineEvent::StageProgress {
                             stage: EngineStage::Upload,
@@ -462,13 +497,35 @@ where
                     mbps: stats.mbps,
                     bytes: stats.bytes,
                     duration_seconds: settings.upload_seconds,
-                    connections: clamp_worker_count(settings.upload_connections),
+                    connections: upload_config.connections,
+                    actual_duration_seconds: Some(stats.actual_duration_ms as f64 / 1_000.0),
+                    average_mbps: stats.throughput.as_ref().map(|t| t.average_mbps()),
+                    mst_mbps: stats.throughput.as_ref().map(|t| t.mst_mbps()),
                 });
                 result.sdk_upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
                 result.sdk_upload_remote_intervals =
                     (!remote_intervals.is_empty()).then_some(remote_intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
+                    let mst_speeds = stats.throughput.as_ref().map(|t| MstSpeedsOut {
+                        average: t.average_bps * 8.0 / 1_000_000.0,
+                        mst_66_20: t.mst_66_20_bps * 8.0 / 1_000_000.0,
+                        mst_66_30: t.mst_66_30_bps * 8.0 / 1_000_000.0,
+                        mst_75_30: t.mst_75_30_bps * 8.0 / 1_000_000.0,
+                        blended: t.blended_bps * 8.0 / 1_000_000.0,
+                        superspeed: t.superspeed_bps * 8.0 / 1_000_000.0,
+                    });
+                    let mst_buckets = stats.throughput.as_ref().map(|t| {
+                        t.buckets_500ms
+                            .iter()
+                            .map(|b| MstBucketOut {
+                                start_ms: b.start_ms,
+                                stop_ms: b.stop_ms,
+                                bytes: b.bytes,
+                                bandwidth_mbps: b.bandwidth_bytes_per_sec() * 8.0 / 1_000_000.0,
+                            })
+                            .collect()
+                    });
                     details.upload = Some(DirectionDetails {
                         request_attempts: stats.request_attempts,
                         request_successes: stats.request_successes,
@@ -478,6 +535,8 @@ where
                         intervals,
                         remote_intervals: (!remote_intervals.is_empty())
                             .then_some(remote_intervals),
+                        mst_speeds,
+                        mst_buckets,
                     });
                 }
 
