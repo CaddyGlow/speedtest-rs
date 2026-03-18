@@ -1,3 +1,7 @@
+mod latency;
+mod selection;
+mod throughput;
+
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
@@ -9,7 +13,20 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::model::{BenchmarkResult, DirectionDetails, RunResult, Server, ThroughputInterval};
+use crate::model::{BenchmarkResult, RunResult, SdkArtifacts};
+
+use self::latency::{
+    SdkLatencyPayload, calculate_jitter_ms, build_latency_payload, latency_stats,
+    selected_latency_samples,
+};
+use self::selection::{
+    SdkServerListEntry, SdkServerSelection, build_server_list_entry, build_server_selection,
+    parse_host_and_port,
+};
+use self::throughput::{
+    SdkDirectionSpeeds, SdkThroughputSample, build_direction_samples, build_speed_profile,
+    direction_samples_from_intervals, local_upload_bps, remote_upload_bps,
+};
 
 static GUID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -32,13 +49,14 @@ pub fn generate_sdk_guid() -> String {
 
 pub fn write_sdk_result_json_file(
     result: &RunResult,
+    sdk_artifacts: &SdkArtifacts,
     output_path: &Path,
     guid: Option<&str>,
 ) -> Result<String> {
     let guid = guid
         .map(ToString::to_string)
         .unwrap_or_else(generate_sdk_guid);
-    let payload = build_sdk_result_payload(result, &guid)?;
+    let payload = build_sdk_result_payload(result, sdk_artifacts, &guid)?;
     let body = serde_json::to_string_pretty(&payload)?;
 
     if let Some(parent) = output_path.parent()
@@ -57,7 +75,11 @@ pub fn write_sdk_result_json_file(
     Ok(guid)
 }
 
-pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_json::Value> {
+pub fn build_sdk_result_payload(
+    result: &RunResult,
+    sdk_artifacts: &SdkArtifacts,
+    guid: &str,
+) -> Result<serde_json::Value> {
     let client = result
         .client
         .as_ref()
@@ -73,7 +95,8 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
         bail!("ping must be a finite non-negative number");
     }
 
-    let (hostname, port) = parse_host_and_port(&server.host, &server.url_fallback());
+    let fallback_url = format!("https://{}/speedtest/upload.php", server.host);
+    let (hostname, port) = parse_host_and_port(&server.host, &fallback_url);
     let server_list_source = result
         .server_pool
         .as_ref()
@@ -87,24 +110,24 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
     let download_bps = result.download.as_ref().map(mbps_to_bps).transpose()?;
     let upload_effective_bps = result.upload.as_ref().map(mbps_to_bps).transpose()?;
     let upload_local_bps = if upload_effective_bps.is_some() {
-        local_upload_bps(result).or(upload_effective_bps)
+        local_upload_bps(result, sdk_artifacts).or(upload_effective_bps)
     } else {
         None
     };
-    let upload_remote_bps = remote_upload_bps(result);
+    let upload_remote_bps = remote_upload_bps(result, sdk_artifacts);
     let protocols = infer_protocols(result.speedtest_api.as_deref());
-    let pings = selected_latency_samples(result).unwrap_or_else(|| vec![ping_ms]);
+    let pings = selected_latency_samples(result, sdk_artifacts).unwrap_or_else(|| vec![ping_ms]);
     let ping = latency_stats(&pings)
         .map(|stats| stats.min)
         .unwrap_or(ping_ms);
     let jitter = calculate_jitter_ms(&pings);
-    let download_latency_samples = result
-        .sdk_download_latency_samples_ms
+    let download_latency_samples = sdk_artifacts
+        .download_latency_samples_ms
         .clone()
         .filter(|samples| !samples.is_empty())
         .unwrap_or_else(|| pings.clone());
-    let upload_latency_samples = result
-        .sdk_upload_latency_samples_ms
+    let upload_latency_samples = sdk_artifacts
+        .upload_latency_samples_ms
         .clone()
         .filter(|samples| !samples.is_empty())
         .unwrap_or_else(|| pings.clone());
@@ -132,7 +155,7 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
     let supplemental_data = build_supplemental_data(result)?;
     let download_samples = if download_bps.is_some() {
         build_direction_samples(
-            result.sdk_download_intervals.as_deref(),
+            sdk_artifacts.download_intervals.as_deref(),
             result
                 .details
                 .as_ref()
@@ -144,7 +167,7 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
     };
     let upload_samples = if upload_effective_bps.is_some() {
         build_direction_samples(
-            result.sdk_upload_intervals.as_deref(),
+            sdk_artifacts.upload_intervals.as_deref(),
             result
                 .details
                 .as_ref()
@@ -154,8 +177,8 @@ pub fn build_sdk_result_payload(result: &RunResult, guid: &str) -> Result<serde_
     } else {
         None
     };
-    let upload_remote_samples = result
-        .sdk_upload_remote_intervals
+    let upload_remote_samples = sdk_artifacts
+        .upload_remote_intervals
         .as_deref()
         .and_then(direction_samples_from_intervals);
     let server_selection = build_server_selection(result, server, ping);
@@ -318,57 +341,6 @@ fn bps_to_sdk_units(bps: u64) -> u64 {
     ((bps as f64) / 125.0).round() as u64
 }
 
-fn remote_upload_bps(result: &RunResult) -> Option<u64> {
-    if let Some(intervals) = result.sdk_upload_remote_intervals.as_ref()
-        && let Some(last) = intervals.last()
-        && last.mbps.is_finite()
-        && last.mbps >= 0.0
-    {
-        return Some((last.mbps * 1_000_000.0).round() as u64);
-    }
-
-    let remote_mbps = result
-        .details
-        .as_ref()?
-        .upload
-        .as_ref()?
-        .remote_intervals
-        .as_ref()?
-        .last()?
-        .mbps;
-
-    if !remote_mbps.is_finite() || remote_mbps < 0.0 {
-        return None;
-    }
-
-    Some((remote_mbps * 1_000_000.0).round() as u64)
-}
-
-fn local_upload_bps(result: &RunResult) -> Option<u64> {
-    if let Some(intervals) = result.sdk_upload_intervals.as_ref()
-        && let Some(last) = intervals.last()
-        && last.mbps.is_finite()
-        && last.mbps >= 0.0
-    {
-        return Some((last.mbps * 1_000_000.0).round() as u64);
-    }
-
-    let local_mbps = result
-        .details
-        .as_ref()?
-        .upload
-        .as_ref()?
-        .intervals
-        .last()?
-        .mbps;
-
-    if !local_mbps.is_finite() || local_mbps < 0.0 {
-        return None;
-    }
-
-    Some((local_mbps * 1_000_000.0).round() as u64)
-}
-
 fn infer_protocols(speedtest_api: Option<&str>) -> SdkProtocols {
     match speedtest_api {
         Some("tcp") => SdkProtocols {
@@ -392,683 +364,11 @@ fn infer_protocols(speedtest_api: Option<&str>) -> SdkProtocols {
     }
 }
 
-fn selected_latency_samples(result: &RunResult) -> Option<Vec<f64>> {
-    let samples = result
-        .sdk_selected_latency_samples_ms
-        .as_ref()
-        .or_else(|| {
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.selected_server_latency.samples_ms.as_ref())
-        })?;
-
-    let normalized = samples
-        .iter()
-        .copied()
-        .filter(|sample| sample.is_finite() && *sample >= 0.0)
-        .collect::<Vec<_>>();
-
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn calculate_jitter_ms(samples: &[f64]) -> f64 {
-    if samples.len() < 2 {
-        return 0.0;
-    }
-
-    let mut total_delta = 0.0;
-    for index in 1..samples.len() {
-        total_delta += (samples[index] - samples[index - 1]).abs();
-    }
-
-    round_to(total_delta / (samples.len() - 1) as f64, 3)
-}
-
 fn split_client_ips(client_ip: &str) -> (Option<String>, Option<String>) {
     match client_ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(_)) => (Some(client_ip.to_string()), None),
         Ok(IpAddr::V6(_)) => (Some(client_ip.to_string()), Some(client_ip.to_string())),
         Err(_) => (Some(client_ip.to_string()), None),
-    }
-}
-
-fn build_latency_payload(
-    samples: &[f64],
-    jitter_ms: f64,
-    connection_protocol: &str,
-    include_sample_arrays: bool,
-) -> Option<SdkLatencyPayload> {
-    let stats = latency_stats(samples)?;
-    let jitter = if jitter_ms.is_finite() && jitter_ms >= 0.0 {
-        jitter_ms
-    } else {
-        calculate_jitter_ms(samples)
-    };
-
-    Some(SdkLatencyPayload {
-        connection_protocol: connection_protocol.to_string(),
-        tcp: SdkLatencyTcp {
-            rtt: stats,
-            jitter,
-            count: samples.len() as u64,
-            samples: include_sample_arrays.then(|| samples.to_vec()),
-            graph_samples: include_sample_arrays.then(|| samples.to_vec()),
-        },
-    })
-}
-
-fn latency_stats(samples: &[f64]) -> Option<SdkRtt> {
-    if samples.is_empty() {
-        return None;
-    }
-
-    let mut values = samples
-        .iter()
-        .copied()
-        .filter(|sample| sample.is_finite() && *sample >= 0.0)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return None;
-    }
-
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let min = values[0];
-    let max = values[values.len() - 1];
-    let median = if values.len() <= 2 {
-        mean
-    } else {
-        let middle = values.len() / 2;
-        if values.len() % 2 == 1 {
-            values[middle]
-        } else {
-            let left = values[middle];
-            let right = values.get(middle + 1).copied().unwrap_or(left);
-            (left + right) / 2.0
-        }
-    };
-    let iqm = calculate_iqm(&values);
-
-    Some(SdkRtt {
-        iqm,
-        mean,
-        median,
-        min,
-        max,
-    })
-}
-
-fn calculate_iqm(values: &[f64]) -> f64 {
-    match values.len() {
-        0 => 0.0,
-        1 => values[0],
-        2 => (values[0] + values[1]) / 2.0,
-        len => {
-            let lower = len as f64 / 4.0;
-            let upper = 3.0 * len as f64 / 4.0;
-            let start = lower.ceil() as usize;
-            let end = upper.floor() as usize;
-            let fraction = upper - upper.floor();
-            let core_sum = if start < end {
-                values[start..end].iter().sum::<f64>()
-            } else {
-                0.0
-            };
-            let edge_sum = if start > 0 && end < len {
-                values[start - 1] + values[end]
-            } else {
-                0.0
-            };
-            (fraction * edge_sum + core_sum) / (len as f64 / 2.0)
-        }
-    }
-}
-
-fn round_to(value: f64, digits: i32) -> f64 {
-    let scale = 10_f64.powi(digits);
-    (value * scale).round() / scale
-}
-
-fn build_direction_samples(
-    sdk_intervals: Option<&[ThroughputInterval]>,
-    details: Option<&DirectionDetails>,
-    fallback: Option<&BenchmarkResult>,
-) -> Result<Option<Vec<SdkThroughputSample>>> {
-    if let Some(sdk_samples) = sdk_intervals.and_then(direction_samples_from_intervals)
-        && !sdk_samples.is_empty()
-    {
-        return Ok(Some(sdk_samples));
-    }
-
-    if let Some(details) = details {
-        let samples = direction_samples_from_intervals(&details.intervals).unwrap_or_default();
-        if !samples.is_empty() {
-            return Ok(Some(samples));
-        }
-    }
-
-    let Some(fallback) = fallback else {
-        return Ok(None);
-    };
-
-    let bps = mbps_to_bps(fallback)?;
-    Ok(Some(vec![SdkThroughputSample {
-        elapsed: fallback.duration_seconds as f64,
-        bytes: fallback.bytes,
-        mbps: fallback.mbps,
-        bps,
-    }]))
-}
-
-fn direction_samples_from_intervals(
-    intervals: &[ThroughputInterval],
-) -> Option<Vec<SdkThroughputSample>> {
-    let samples = intervals
-        .iter()
-        .filter_map(interval_to_sdk_sample)
-        .collect::<Vec<_>>();
-    if samples.is_empty() {
-        None
-    } else {
-        Some(samples)
-    }
-}
-
-fn interval_to_sdk_sample(interval: &ThroughputInterval) -> Option<SdkThroughputSample> {
-    if !interval.elapsed_seconds.is_finite()
-        || interval.elapsed_seconds < 0.0
-        || !interval.mbps.is_finite()
-        || interval.mbps < 0.0
-    {
-        return None;
-    }
-
-    Some(SdkThroughputSample {
-        elapsed: interval.elapsed_seconds,
-        bytes: interval.bytes,
-        mbps: interval.mbps,
-        bps: (interval.mbps * 1_000_000.0).round() as u64,
-    })
-}
-
-fn build_speed_profile(
-    combined_bps: Option<u64>,
-    samples: Option<&[SdkThroughputSample]>,
-    duration_seconds: Option<u64>,
-) -> Option<SdkCombinedSpeed> {
-    let combined = combined_bps?;
-    let baseline = combined as f64;
-    let transfer_samples = samples.map(to_transfer_samples).unwrap_or_default();
-    if transfer_samples.is_empty() {
-        return Some(SdkCombinedSpeed {
-            combined,
-            average: baseline,
-            mst_66_20: baseline,
-            mst_66_30: baseline,
-            mst_75_30: baseline,
-            superspeed: baseline,
-        });
-    }
-
-    let duration_millis = duration_seconds
-        .map(|seconds| seconds as f64 * 1_000.0)
-        .unwrap_or_else(|| {
-            transfer_samples
-                .last()
-                .map(|sample| sample.received_reply_at_ms)
-                .unwrap_or(0.0)
-                .max(1_000.0)
-        });
-
-    let average = calculate_average_speed_bps(&transfer_samples).unwrap_or(baseline);
-    let mst_66_20 =
-        calculate_mst_speed_bps(&transfer_samples, 2.0 / 3.0, 750.0, 600.0).unwrap_or(average);
-    let mst_66_30 =
-        calculate_mst_speed_bps(&transfer_samples, 2.0 / 3.0, 500.0, 500.0).unwrap_or(average);
-    let mst_75_30 =
-        calculate_mst_speed_bps(&transfer_samples, 0.75, 500.0, 500.0).unwrap_or(average);
-    let superspeed = calculate_superspeed_bps(&transfer_samples, duration_millis, 500.0, 500.0)
-        .unwrap_or(average);
-
-    Some(SdkCombinedSpeed {
-        combined,
-        average,
-        mst_66_20,
-        mst_66_30,
-        mst_75_30,
-        superspeed,
-    })
-}
-
-fn to_transfer_samples(samples: &[SdkThroughputSample]) -> Vec<SdkTransferSample> {
-    let mut transfers = Vec::new();
-    let mut previous_elapsed_ms = 0.0;
-    let mut previous_bytes = 0_u64;
-
-    for sample in samples {
-        let elapsed_ms = sample.elapsed * 1_000.0;
-        if !elapsed_ms.is_finite() || elapsed_ms <= previous_elapsed_ms {
-            continue;
-        }
-
-        let bytes_delta = sample.bytes.saturating_sub(previous_bytes);
-        transfers.push(SdkTransferSample {
-            elapsed_ms,
-            size: bytes_delta,
-            sent_at_ms: previous_elapsed_ms,
-            received_reply_at_ms: elapsed_ms,
-        });
-
-        previous_elapsed_ms = elapsed_ms;
-        previous_bytes = sample.bytes;
-    }
-
-    transfers
-}
-
-fn calculate_average_speed_bps(samples: &[SdkTransferSample]) -> Option<f64> {
-    let total_bytes = samples.iter().map(|sample| sample.size).sum::<u64>() as f64;
-    let elapsed_ms = samples
-        .last()
-        .map(|sample| sample.elapsed_ms)
-        .filter(|value| value.is_finite() && *value > 0.0)?;
-    Some(total_bytes * 8.0 * 1_000.0 / elapsed_ms)
-}
-
-fn calculate_mst_speed_bps(
-    samples: &[SdkTransferSample],
-    kept_samples_percentage: f64,
-    sample_length_ms: f64,
-    minimum_sample_length_ms: f64,
-) -> Option<f64> {
-    let calculator =
-        BucketedThroughputCalculator::new(sample_length_ms, minimum_sample_length_ms, None);
-    let buckets = calculator.build(samples);
-    let mut completed = buckets
-        .buckets
-        .iter()
-        .filter_map(|bucket| (*bucket).to_bandwidth_sample())
-        .collect::<Vec<_>>();
-
-    let completed_count = completed.len();
-    if completed_count < 4 {
-        return None;
-    }
-
-    completed.sort_by(|left, right| {
-        left.bandwidth_bps
-            .partial_cmp(&right.bandwidth_bps)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    if completed.len() <= 2 {
-        return None;
-    }
-    let mut trimmed = completed[1..completed.len() - 1].to_vec();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let keep_ratio = kept_samples_percentage.clamp(0.0, 1.0);
-    let drop_count = (((completed_count - 2) as f64) * (1.0 - keep_ratio)).floor() as usize;
-    if drop_count >= trimmed.len() {
-        trimmed = vec![trimmed[trimmed.len() - 1]];
-    } else if drop_count > 0 {
-        trimmed = trimmed.split_off(drop_count);
-    }
-
-    let aggregate = trimmed.iter().fold(
-        AggregateBandwidthSample {
-            duration_ms: 0.0,
-            bytes_transferred: 0.0,
-        },
-        |acc, sample| AggregateBandwidthSample {
-            duration_ms: acc.duration_ms + sample.duration_ms,
-            bytes_transferred: acc.bytes_transferred + sample.bytes_transferred,
-        },
-    );
-
-    if aggregate.duration_ms <= 0.0 {
-        None
-    } else {
-        Some(aggregate.bytes_transferred * 8.0 * 1_000.0 / aggregate.duration_ms)
-    }
-}
-
-fn calculate_superspeed_bps(
-    samples: &[SdkTransferSample],
-    test_duration_ms: f64,
-    sample_length_ms: f64,
-    minimum_sample_length_ms: f64,
-) -> Option<f64> {
-    if !test_duration_ms.is_finite() || test_duration_ms <= 0.0 {
-        return None;
-    }
-
-    let calculator = BucketedThroughputCalculator::new(
-        sample_length_ms,
-        minimum_sample_length_ms,
-        Some(test_duration_ms),
-    );
-    let buckets = calculator.build(samples);
-    let first_good_index = buckets.first_good_end_sample_index?;
-    let completed = buckets
-        .buckets
-        .iter()
-        .filter(|bucket| bucket.stop_time_ms.is_some())
-        .collect::<Vec<_>>();
-
-    if first_good_index >= completed.len() {
-        return None;
-    }
-
-    let minimum_window_ms = test_duration_ms / 2.0;
-    let mut best_bps = 0.0;
-
-    for start_index in 0..=first_good_index {
-        for end_index in first_good_index..completed.len() {
-            let start = completed[start_index];
-            let end = completed[end_index];
-            let Some(end_stop_ms) = end.stop_time_ms else {
-                continue;
-            };
-
-            let window_ms = end_stop_ms - start.start_time_ms;
-            if window_ms < minimum_window_ms || window_ms <= 0.0 {
-                continue;
-            }
-
-            let bytes = end.total_bytes_transferred as f64
-                - (start.total_bytes_transferred as f64 - start.bytes_transferred as f64);
-            let speed_bps = bytes * 8.0 * 1_000.0 / window_ms;
-            if speed_bps > best_bps {
-                best_bps = speed_bps;
-            }
-        }
-    }
-
-    if best_bps > 0.0 { Some(best_bps) } else { None }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SdkTransferSample {
-    elapsed_ms: f64,
-    size: u64,
-    sent_at_ms: f64,
-    received_reply_at_ms: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SdkThroughputBucket {
-    bytes_transferred: u64,
-    start_time_ms: f64,
-    stop_time_ms: Option<f64>,
-    total_bytes_transferred: u64,
-}
-
-impl SdkThroughputBucket {
-    fn duration_ms(self) -> Option<f64> {
-        let stop = self.stop_time_ms?;
-        let duration = stop - self.start_time_ms;
-        (duration.is_finite() && duration > 0.0).then_some(duration)
-    }
-
-    fn bandwidth_bps(self) -> Option<f64> {
-        let duration_ms = self.duration_ms()?;
-        Some(self.bytes_transferred as f64 * 8.0 * 1_000.0 / duration_ms)
-    }
-
-    fn to_bandwidth_sample(self) -> Option<BandwidthSample> {
-        Some(BandwidthSample {
-            bandwidth_bps: self.bandwidth_bps()?,
-            duration_ms: self.duration_ms()?,
-            bytes_transferred: self.bytes_transferred as f64,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BandwidthSample {
-    bandwidth_bps: f64,
-    duration_ms: f64,
-    bytes_transferred: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AggregateBandwidthSample {
-    duration_ms: f64,
-    bytes_transferred: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FragmentedTransfer {
-    target_bucket: usize,
-    size: u64,
-}
-
-#[derive(Debug)]
-struct BucketedThroughput {
-    buckets: Vec<SdkThroughputBucket>,
-    first_good_end_sample_index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BucketedThroughputCalculator {
-    sample_length_ms: f64,
-    minimum_sample_length_ms: f64,
-    test_duration_ms: Option<f64>,
-}
-
-impl BucketedThroughputCalculator {
-    fn new(
-        sample_length_ms: f64,
-        minimum_sample_length_ms: f64,
-        test_duration_ms: Option<f64>,
-    ) -> Self {
-        Self {
-            sample_length_ms,
-            minimum_sample_length_ms,
-            test_duration_ms,
-        }
-    }
-
-    fn build(self, samples: &[SdkTransferSample]) -> BucketedThroughput {
-        let mut buckets = Vec::new();
-        let mut first_good_end_sample_index = None;
-        self.create_bucket(0.0, &mut buckets, &mut first_good_end_sample_index);
-
-        let max_bucket = (15_000.0 / self.minimum_sample_length_ms).ceil() as usize;
-        for sample in samples {
-            if !sample.elapsed_ms.is_finite() || sample.elapsed_ms < 0.0 {
-                continue;
-            }
-
-            let target_bucket = self
-                .calculate_target_bucket(sample.elapsed_ms, &buckets)
-                .min(max_bucket);
-
-            while buckets.len() <= target_bucket {
-                self.create_bucket(
-                    sample.elapsed_ms,
-                    &mut buckets,
-                    &mut first_good_end_sample_index,
-                );
-            }
-
-            let fragments = self.fragment_sample(sample, target_bucket, &buckets);
-            for fragment in fragments {
-                if fragment.target_bucket >= buckets.len() {
-                    continue;
-                }
-                buckets[fragment.target_bucket].bytes_transferred = buckets[fragment.target_bucket]
-                    .bytes_transferred
-                    .saturating_add(fragment.size);
-
-                for bucket in &mut buckets[fragment.target_bucket..] {
-                    bucket.total_bytes_transferred =
-                        bucket.total_bytes_transferred.saturating_add(fragment.size);
-                }
-            }
-        }
-
-        BucketedThroughput {
-            buckets,
-            first_good_end_sample_index,
-        }
-    }
-
-    fn calculate_target_bucket(self, elapsed_ms: f64, buckets: &[SdkThroughputBucket]) -> usize {
-        if (self.sample_length_ms - self.minimum_sample_length_ms).abs() < f64::EPSILON {
-            return (elapsed_ms / self.sample_length_ms).floor() as usize;
-        }
-
-        let bucket_count = buckets.len();
-        let expected_count = (elapsed_ms / self.sample_length_ms).floor() as usize + 1;
-        let min_ready_at = buckets
-            .last()
-            .map(|bucket| bucket.start_time_ms + self.minimum_sample_length_ms)
-            .unwrap_or(self.minimum_sample_length_ms);
-
-        if bucket_count < expected_count && elapsed_ms >= min_ready_at {
-            expected_count.saturating_sub(1)
-        } else {
-            bucket_count.saturating_sub(1)
-        }
-    }
-
-    fn fragment_sample(
-        self,
-        sample: &SdkTransferSample,
-        mut target_bucket: usize,
-        buckets: &[SdkThroughputBucket],
-    ) -> Vec<FragmentedTransfer> {
-        if sample.size == 0 {
-            return Vec::new();
-        }
-
-        let mut fragments = Vec::new();
-        let mut remaining = sample.size;
-        let mut received_reply_at_ms = sample.received_reply_at_ms;
-        let sent_at_ms = sample.sent_at_ms;
-
-        while remaining > 0
-            && target_bucket > 0
-            && sent_at_ms < buckets[target_bucket].start_time_ms
-        {
-            let overlap = received_reply_at_ms - buckets[target_bucket].start_time_ms;
-            if overlap > 0.0 {
-                let total = received_reply_at_ms - sent_at_ms;
-                if total > 0.0 {
-                    let ratio = overlap / total;
-                    let fragment_size = ((remaining as f64 * ratio).round() as u64).min(remaining);
-                    if fragment_size > 0 {
-                        fragments.push(FragmentedTransfer {
-                            target_bucket,
-                            size: fragment_size,
-                        });
-                        remaining -= fragment_size;
-                    }
-                }
-            }
-
-            target_bucket -= 1;
-            if let Some(stop_time_ms) = buckets[target_bucket].stop_time_ms {
-                received_reply_at_ms = stop_time_ms;
-            } else {
-                break;
-            }
-        }
-
-        if remaining > 0 {
-            fragments.push(FragmentedTransfer {
-                target_bucket,
-                size: remaining,
-            });
-        }
-
-        fragments
-    }
-
-    fn create_bucket(
-        self,
-        elapsed_ms: f64,
-        buckets: &mut Vec<SdkThroughputBucket>,
-        first_good_end_sample_index: &mut Option<usize>,
-    ) {
-        let mut start_time_ms = elapsed_ms;
-        let mut total_bytes_transferred = 0_u64;
-
-        if let Some(last_bucket) = buckets.last_mut() {
-            let stop_time_ms = (last_bucket.start_time_ms + self.sample_length_ms).min(elapsed_ms);
-            last_bucket.stop_time_ms = Some(stop_time_ms);
-            start_time_ms = stop_time_ms;
-            total_bytes_transferred = last_bucket.total_bytes_transferred;
-        }
-
-        buckets.push(SdkThroughputBucket {
-            bytes_transferred: 0,
-            start_time_ms,
-            stop_time_ms: None,
-            total_bytes_transferred,
-        });
-
-        if first_good_end_sample_index.is_none()
-            && let Some(test_duration_ms) = self.test_duration_ms
-            && start_time_ms > (test_duration_ms / 2.0)
-        {
-            *first_good_end_sample_index = buckets.len().checked_sub(1);
-        }
-    }
-}
-
-fn build_server_selection(
-    result: &RunResult,
-    selected: &Server,
-    fallback_ping: f64,
-) -> Option<SdkServerSelection> {
-    let source_servers = result
-        .server_pool
-        .as_ref()
-        .filter(|servers| !servers.is_empty())
-        .cloned()
-        .unwrap_or_else(|| vec![selected.clone()]);
-
-    let mut details = source_servers
-        .into_iter()
-        .filter_map(|server| {
-            let ping = server.latency_ms.unwrap_or(fallback_ping);
-            if !ping.is_finite() || ping < 0.0 {
-                return None;
-            }
-            Some(SdkClosestPingDetail {
-                id: server.id,
-                name: server.name,
-                sponsor: server.sponsor,
-                host: server.host,
-                distance: server.distance_km,
-                ping,
-                jitter: server.latency_stddev_ms,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    details.sort_by(|left, right| {
-        left.ping
-            .partial_cmp(&right.ping)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    if details.is_empty() {
-        None
-    } else {
-        Some(SdkServerSelection {
-            closest_ping_details: details,
-        })
     }
 }
 
@@ -1094,84 +394,6 @@ fn calculate_result_hash(ping: f64, upload: Option<u64>, download: Option<u64>) 
     let download = download.unwrap_or(0);
     let hash_input = format!("{ping}-{upload}-{download}-817d699764d33f89c");
     format!("{:x}", md5::compute(hash_input))
-}
-
-fn parse_host_and_port(host: &str, fallback_url: &str) -> (String, u16) {
-    if let Some((name, port)) = split_host_port(host) {
-        return (name.to_string(), port);
-    }
-
-    let parsed = url::Url::parse(fallback_url).ok();
-    let hostname = parsed
-        .as_ref()
-        .and_then(url::Url::host_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let port = parsed
-        .as_ref()
-        .and_then(url::Url::port_or_known_default)
-        .unwrap_or(8080);
-    (hostname, port)
-}
-
-fn split_host_port(host: &str) -> Option<(&str, u16)> {
-    if host.starts_with('[') {
-        let end = host.find(']')?;
-        let name = &host[1..end];
-        let rest = &host[end + 1..];
-        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((name, port));
-    }
-
-    let (name, port) = host.rsplit_once(':')?;
-    let parsed_port = port.parse::<u16>().ok()?;
-    Some((name, parsed_port))
-}
-
-fn build_server_list_entry(
-    server: &Server,
-    client: &crate::model::ClientMeta,
-) -> SdkServerListEntry {
-    let fallback_url = server.url_fallback();
-    let (hostname, port) = parse_host_and_port(&server.host, &fallback_url);
-
-    SdkServerListEntry {
-        url: server.sdk_url.clone().unwrap_or(fallback_url),
-        lat: server
-            .sdk_lat
-            .clone()
-            .unwrap_or_else(|| format!("{:.4}", client.latitude)),
-        lon: server
-            .sdk_lon
-            .clone()
-            .unwrap_or_else(|| format!("{:.4}", client.longitude)),
-        distance: server.distance_km.round() as u64,
-        name: server.name.clone(),
-        country: server.country.clone(),
-        cc: server
-            .sdk_cc
-            .clone()
-            .unwrap_or_else(|| client.country.clone()),
-        sponsor: server.sponsor.clone(),
-        id: server.id,
-        preferred: server.sdk_preferred.unwrap_or(0),
-        isp_id: server.sdk_isp_id.clone().unwrap_or_else(|| "0".to_string()),
-        https_functional: server.sdk_https_functional.unwrap_or(1),
-        host: server.host.clone(),
-        hostname: server.sdk_hostname.clone().unwrap_or(hostname),
-        port: server.sdk_port.unwrap_or(port),
-        force_ping_select: server.sdk_force_ping_select,
-    }
-}
-
-trait ServerUrlFallback {
-    fn url_fallback(&self) -> String;
-}
-
-impl ServerUrlFallback for Server {
-    fn url_fallback(&self) -> String {
-        format!("https://{}/speedtest/upload.php", self.host)
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1342,51 +564,6 @@ struct SdkLocation {
 }
 
 #[derive(Debug, Serialize)]
-struct SdkLatencyPayload {
-    #[serde(rename = "connectionProtocol")]
-    connection_protocol: String,
-    tcp: SdkLatencyTcp,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkLatencyTcp {
-    rtt: SdkRtt,
-    jitter: f64,
-    count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    samples: Option<Vec<f64>>,
-    #[serde(rename = "graphSamples", skip_serializing_if = "Option::is_none")]
-    graph_samples: Option<Vec<f64>>,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkRtt {
-    iqm: f64,
-    mean: f64,
-    median: f64,
-    min: f64,
-    max: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkServerSelection {
-    #[serde(rename = "closestPingDetails")]
-    closest_ping_details: Vec<SdkClosestPingDetail>,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkClosestPingDetail {
-    id: u64,
-    name: String,
-    sponsor: String,
-    host: String,
-    distance: f64,
-    ping: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jitter: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
 struct SdkLogErrorsToServer {
     level: String,
     #[serde(rename = "useCostanza")]
@@ -1408,68 +585,19 @@ struct SdkConnections {
     mode: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SdkServerListEntry {
-    url: String,
-    lat: String,
-    lon: String,
-    distance: u64,
-    name: String,
-    country: String,
-    cc: String,
-    sponsor: String,
-    id: u64,
-    preferred: u8,
-    #[serde(rename = "isp_id")]
-    isp_id: String,
-    #[serde(rename = "httpsFunctional")]
-    https_functional: u8,
-    host: String,
-    hostname: String,
-    port: u16,
-    #[serde(rename = "force_ping_select", skip_serializing_if = "Option::is_none")]
-    force_ping_select: Option<u8>,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkDirectionSpeeds {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local: Option<SdkCombinedSpeed>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote: Option<SdkCombinedSpeed>,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkCombinedSpeed {
-    combined: u64,
-    average: f64,
-    #[serde(rename = "mst_66_20")]
-    mst_66_20: f64,
-    #[serde(rename = "mst_66_30")]
-    mst_66_30: f64,
-    #[serde(rename = "mst_75_30")]
-    mst_75_30: f64,
-    superspeed: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkThroughputSample {
-    elapsed: f64,
-    bytes: u64,
-    mbps: f64,
-    bps: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{build_sdk_result_payload, write_sdk_result_json_file};
-    use crate::model::{BenchmarkResult, ClientMeta, RunResult, Server, ThroughputInterval};
+    use crate::model::{
+        BenchmarkResult, ClientMeta, RunResult, SdkArtifacts, Server, ThroughputInterval,
+    };
 
     #[test]
     fn builds_sdk_payload_from_run_result() {
-        let result = sample_result();
-        let payload = build_sdk_result_payload(&result, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
-            .expect("payload should build");
+        let (result, sdk_artifacts) = sample_result();
+        let payload =
+            build_sdk_result_payload(&result, &sdk_artifacts, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
+                .expect("payload should build");
 
         assert_eq!(payload["source"], "st4-js");
         assert_eq!(payload["serverid"], 61301);
@@ -1513,11 +641,11 @@ mod tests {
 
     #[test]
     fn writes_sdk_payload_file() {
-        let result = sample_result();
+        let (result, sdk_artifacts) = sample_result();
         let temp =
             std::env::temp_dir().join(format!("tunmux-speedtest-sdk-{}.json", std::process::id()));
 
-        let guid = write_sdk_result_json_file(&result, &temp, Some("guid-123"))
+        let guid = write_sdk_result_json_file(&result, &sdk_artifacts, &temp, Some("guid-123"))
             .expect("must write payload file");
         assert_eq!(guid, "guid-123");
 
@@ -1529,11 +657,12 @@ mod tests {
 
     #[test]
     fn omits_missing_direction_metrics() {
-        let mut result = sample_result();
+        let (mut result, sdk_artifacts) = sample_result();
         result.upload = None;
 
-        let payload = build_sdk_result_payload(&result, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
-            .expect("payload should build without upload");
+        let payload =
+            build_sdk_result_payload(&result, &sdk_artifacts, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
+                .expect("payload should build without upload");
 
         assert!(payload.get("upload").is_none());
         assert!(payload.get("uploadSpeeds").is_none());
@@ -1542,8 +671,8 @@ mod tests {
         assert!(payload.get("download").is_some());
     }
 
-    fn sample_result() -> RunResult {
-        RunResult {
+    fn sample_result() -> (RunResult, SdkArtifacts) {
+        let result = RunResult {
             timestamp: "1771795845".to_string(),
             speedtest_api: Some("modern".to_string()),
             client: Some(ClientMeta {
@@ -1607,21 +736,26 @@ mod tests {
             }),
             upload_latency_ms: None,
             proxy: None,
-            sdk_selected_latency_samples_ms: Some(vec![2.940037]),
-            sdk_download_intervals: Some(vec![ThroughputInterval {
+            details: None,
+        };
+
+        let sdk_artifacts = SdkArtifacts {
+            selected_latency_samples_ms: Some(vec![2.940037]),
+            download_intervals: Some(vec![ThroughputInterval {
                 elapsed_seconds: 10.0,
                 bytes: 277702500,
                 mbps: 222.162,
             }]),
-            sdk_upload_intervals: Some(vec![ThroughputInterval {
+            upload_intervals: Some(vec![ThroughputInterval {
                 elapsed_seconds: 10.0,
                 bytes: 123687500,
                 mbps: 98.95,
             }]),
-            sdk_upload_remote_intervals: None,
-            sdk_download_latency_samples_ms: None,
-            sdk_upload_latency_samples_ms: None,
-            details: None,
-        }
+            upload_remote_intervals: None,
+            download_latency_samples_ms: None,
+            upload_latency_samples_ms: None,
+        };
+
+        (result, sdk_artifacts)
     }
 }

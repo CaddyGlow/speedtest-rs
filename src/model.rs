@@ -143,18 +143,16 @@ pub struct RunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_latency_ms: Option<f64>,
     pub proxy: Option<String>,
-    #[serde(skip)]
-    pub sdk_selected_latency_samples_ms: Option<Vec<f64>>,
-    #[serde(skip)]
-    pub sdk_download_intervals: Option<Vec<ThroughputInterval>>,
-    #[serde(skip)]
-    pub sdk_upload_intervals: Option<Vec<ThroughputInterval>>,
-    #[serde(skip)]
-    pub sdk_upload_remote_intervals: Option<Vec<ThroughputInterval>>,
-    #[serde(skip)]
-    pub sdk_download_latency_samples_ms: Option<Vec<f64>>,
-    #[serde(skip)]
-    pub sdk_upload_latency_samples_ms: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<RunDetails>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SdkArtifacts {
+    pub selected_latency_samples_ms: Option<Vec<f64>>,
+    pub download_intervals: Option<Vec<ThroughputInterval>>,
+    pub upload_intervals: Option<Vec<ThroughputInterval>>,
+    pub upload_remote_intervals: Option<Vec<ThroughputInterval>>,
+    pub download_latency_samples_ms: Option<Vec<f64>>,
+    pub upload_latency_samples_ms: Option<Vec<f64>>,
 }

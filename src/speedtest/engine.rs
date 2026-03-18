@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::model::{
     BenchmarkResult, ClientMeta, DirectionDetails, MstBucketOut, MstSpeedsOut, RunDetails,
-    RunResult, SelectedServerLatencyDetails, Server, ThroughputInterval,
+    RunResult, SdkArtifacts, SelectedServerLatencyDetails, Server, ThroughputInterval,
 };
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::config::SpeedtestConfig;
@@ -146,6 +146,7 @@ impl EngineSettings {
 #[derive(Debug, Clone)]
 pub struct EngineOutcome {
     pub result: RunResult,
+    pub sdk_artifacts: SdkArtifacts,
     pub sdk_payload: Value,
     pub selected_server: SpeedtestServer,
     #[allow(dead_code)]
@@ -214,6 +215,7 @@ where
     });
 
     let mut result = build_initial_run_result(config, mode, settings, &selection)?;
+    let mut sdk_artifacts = build_initial_sdk_artifacts(&selection);
 
     let mut stage_machine = StageMachine::new(settings.stage_order());
     while let Some(stage) = stage_machine.next() {
@@ -271,7 +273,7 @@ where
 
                 let download_latency_samples = latency_task.await.unwrap_or_default();
                 result.download_latency_ms = average_latency_ms(&download_latency_samples);
-                result.sdk_download_latency_samples_ms =
+                sdk_artifacts.download_latency_samples_ms =
                     (!download_latency_samples.is_empty()).then_some(download_latency_samples);
 
                 push_interval(
@@ -289,7 +291,7 @@ where
                     stats.actual_duration_ms,
                     stats.throughput.as_ref(),
                 ));
-                result.sdk_download_intervals =
+                sdk_artifacts.download_intervals =
                     (!intervals.is_empty()).then_some(intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
@@ -364,7 +366,7 @@ where
 
                 let upload_latency_samples = latency_task.await.unwrap_or_default();
                 result.upload_latency_ms = average_latency_ms(&upload_latency_samples);
-                result.sdk_upload_latency_samples_ms =
+                sdk_artifacts.upload_latency_samples_ms =
                     (!upload_latency_samples.is_empty()).then_some(upload_latency_samples);
 
                 push_interval(
@@ -385,8 +387,8 @@ where
                     stats.actual_duration_ms,
                     stats.throughput.as_ref(),
                 ));
-                result.sdk_upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
-                result.sdk_upload_remote_intervals =
+                sdk_artifacts.upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
+                sdk_artifacts.upload_remote_intervals =
                     (!remote_intervals.is_empty()).then_some(remote_intervals.clone());
 
                 if let Some(details) = result.details.as_mut() {
@@ -419,7 +421,7 @@ where
                     .session_guid
                     .clone()
                     .unwrap_or_else(sdk_payload::generate_sdk_guid);
-                let payload = sdk_payload::build_sdk_result_payload(&result, &guid)
+                let payload = sdk_payload::build_sdk_result_payload(&result, &sdk_artifacts, &guid)
                     .context("failed building SDK payload during save stage")?;
 
                 let hash = payload
@@ -435,6 +437,7 @@ where
 
                 return Ok(EngineOutcome {
                     result,
+                    sdk_artifacts,
                     sdk_payload: payload,
                     selected_server: selection.selected.server,
                     selected_latency: LatencyMeasurement {
@@ -505,13 +508,6 @@ fn build_initial_run_result(
         upload: None,
         upload_latency_ms: None,
         proxy: None,
-        sdk_selected_latency_samples_ms: (!selection.selected.samples_ms.is_empty())
-            .then(|| selection.selected.samples_ms.clone()),
-        sdk_download_intervals: None,
-        sdk_upload_intervals: None,
-        sdk_upload_remote_intervals: None,
-        sdk_download_latency_samples_ms: None,
-        sdk_upload_latency_samples_ms: None,
         details: settings.details.then_some(RunDetails {
             interval_seconds: 1,
             selected_server_latency: SelectedServerLatencyDetails {
@@ -525,6 +521,14 @@ fn build_initial_run_result(
             upload: None,
         }),
     })
+}
+
+fn build_initial_sdk_artifacts(selection: &SelectionOutcome) -> SdkArtifacts {
+    SdkArtifacts {
+        selected_latency_samples_ms: (!selection.selected.samples_ms.is_empty())
+            .then(|| selection.selected.samples_ms.clone()),
+        ..SdkArtifacts::default()
+    }
 }
 
 fn spawn_loaded_latency_task(

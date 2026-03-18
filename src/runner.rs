@@ -411,6 +411,7 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
             .unwrap_or_else(speedtest::sdk_payload::generate_sdk_guid);
         speedtest::sdk_payload::write_sdk_result_json_file(
             &outcome.result,
+            &outcome.sdk_artifacts,
             Path::new(output_path),
             Some(&sdk_guid),
         )
