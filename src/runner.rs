@@ -1,12 +1,14 @@
+mod cache;
+mod speedtest_ui;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
 
-use crate::cli::{CacheCommand, Cli, Command, IperfArgs, IperfProtocol, RunArgs};
+use crate::cli::{Cli, Command, IperfArgs, IperfProtocol, RunArgs};
 use crate::http;
 use crate::iperf;
 use crate::iperf::schema::{
@@ -14,12 +16,13 @@ use crate::iperf::schema::{
     IperfIntervalOut, IperfIntervalResultsOut, IperfJsonV1, IperfProtocolOut, IperfProxyOut,
     IperfResultsOut, IperfTarget,
 };
-use crate::model::Server;
 use crate::output;
 use crate::speedtest;
 use crate::speedtest::engine::{self, EngineSettings as StageEngineSettings};
 use crate::ui;
 use crate::util::{clamp_worker_count, resolve_proxy_url};
+use self::cache::run_cache_command;
+use self::speedtest_ui::SpeedtestUiController;
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli
@@ -29,102 +32,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Cache(cache) => run_cache_command(cache.command),
         Command::Run(args) => run_speedtest(args).await,
         Command::Iperf(args) => run_iperf(args).await,
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct CacheShowOutput {
-    cache_path: String,
-    total_cached: usize,
-    filtered: usize,
-    shown: usize,
-    servers: Vec<Server>,
-}
-
-fn run_cache_command(command: CacheCommand) -> Result<()> {
-    match command {
-        CacheCommand::Path => {
-            let path = speedtest::servers::cache_file_path()?;
-            println!("{}", path.display());
-            Ok(())
-        }
-        CacheCommand::Clear => {
-            let path = speedtest::servers::cache_file_path()?;
-            let removed = speedtest::servers::clear_cached_servers()?;
-            if removed {
-                println!("cleared cache file: {}", path.display());
-            } else {
-                println!("cache file not found: {}", path.display());
-            }
-            Ok(())
-        }
-        CacheCommand::Show(show) => {
-            let path = speedtest::servers::cache_file_path()?;
-            let cached = speedtest::servers::load_cached_servers()?;
-            let filtered = speedtest::servers::filter_servers(&cached, show.search.as_deref());
-            let filtered_count = filtered.len();
-            let displayed = filtered.into_iter().take(show.limit).collect::<Vec<_>>();
-
-            let servers = displayed
-                .into_iter()
-                .map(|server| Server {
-                    id: server.id,
-                    sponsor: server.sponsor.clone(),
-                    name: server.name.clone(),
-                    country: server.country.clone(),
-                    host: server.host.clone(),
-                    distance_km: server.distance_km,
-                    latency_ms: None,
-                    latency_stddev_ms: None,
-                    download_avg_mbps: None,
-                    download_bytes: None,
-                    sdk_url: None,
-                    sdk_lat: None,
-                    sdk_lon: None,
-                    sdk_cc: None,
-                    sdk_preferred: None,
-                    sdk_isp_id: None,
-                    sdk_https_functional: None,
-                    sdk_hostname: None,
-                    sdk_port: None,
-                    sdk_force_ping_select: None,
-                })
-                .collect::<Vec<_>>();
-
-            if show.json {
-                let body = CacheShowOutput {
-                    cache_path: path.display().to_string(),
-                    total_cached: cached.len(),
-                    filtered: filtered_count,
-                    shown: servers.len(),
-                    servers,
-                };
-                println!("{}", serde_json::to_string_pretty(&body)?);
-                return Ok(());
-            }
-
-            println!("cache: {}", path.display());
-            println!("total cached: {}", cached.len());
-            if let Some(search) = show.search.as_deref() {
-                println!("search: {}", search);
-                println!("filtered: {}", filtered_count);
-            }
-            println!("showing: {}", servers.len());
-
-            if servers.is_empty() {
-                println!("no cached servers match");
-                return Ok(());
-            }
-
-            for server in servers {
-                println!(
-                    "- {} | {} | {}, {} | {}",
-                    server.id, server.sponsor, server.name, server.country, server.host
-                );
-            }
-
-            Ok(())
-        }
     }
 }
 
@@ -138,7 +45,12 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
     effective_args.upload_connections = clamp_worker_count(effective_args.upload_connections);
 
     let render_ui = !effective_args.json && !effective_args.no_progress;
-    let mut ui = ui::Ui::new(render_ui);
+    let mut ui = SpeedtestUiController::new(
+        render_ui,
+        effective_args.download_seconds,
+        effective_args.upload_seconds,
+        HashMap::new(),
+    );
 
     ui.render_phase("building HTTP client");
 
@@ -192,12 +104,9 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         .iter()
         .map(|server| (server.id, server.name.clone()))
         .collect::<HashMap<_, _>>();
+    ui.set_server_names(server_names);
 
-    let progress_interval = if render_ui {
-        ui.progress_interval()
-    } else {
-        None
-    };
+    let progress_interval = if render_ui { ui.progress_interval() } else { None };
 
     let transfer_mode = effective_args.mode.into();
 
@@ -216,186 +125,13 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         progress_interval,
     };
 
-    let mut download_progress = None;
-    let mut upload_progress = None;
-    let mut download_last = None;
-    let mut upload_last = None;
-    let mut probe_completed = 0_usize;
-    let mut probe_failed = 0_usize;
-    let mut probe_best: Option<(u64, String, f64, f64)> = None;
-
     let outcome = with_ctrl_c(engine::run_speedtest_engine(
         &client,
         &config,
         &servers,
         transfer_mode,
         &settings,
-        |event| {
-            match event {
-                engine::EngineEvent::StageStarting(stage) => match stage {
-                    engine::EngineStage::ServerSelection => {
-                        ui.render_phase("probing latency across candidates");
-                    }
-                    engine::EngineStage::Latency => {
-                        ui.render_phase("selecting best latency server");
-                    }
-                    engine::EngineStage::Download => {
-                        ui.render_phase("running download test");
-                        download_progress =
-                            Some(ui.begin_speed_progress("download", effective_args.download_seconds));
-                        download_last = None;
-
-                        // keep behavior unchanged: live latency monitor was removed from this path.
-                    }
-                    engine::EngineStage::Upload => {
-                        ui.render_phase("running upload test");
-                        upload_progress =
-                            Some(ui.begin_speed_progress("upload", effective_args.upload_seconds));
-                        upload_last = None;
-                    }
-                    engine::EngineStage::Save => {
-                        ui.render_phase("building result payload");
-                    }
-                    engine::EngineStage::Finished => {
-                        ui.render_phase("benchmark complete");
-                    }
-                },
-                engine::EngineEvent::CandidateProbed {
-                    index,
-                    total,
-                    server_id,
-                    average_ms,
-                    variance_ms,
-                    error,
-                } => {
-                    probe_completed = probe_completed.saturating_add(1);
-                    let server_name = server_names
-                        .get(&server_id)
-                        .map(String::as_str)
-                        .unwrap_or("unknown");
-                    if let Some(avg) = average_ms {
-                        let stddev = variance_ms.unwrap_or(0.0).max(0.0).sqrt();
-                        ui.render_metric(
-                            "probe_current",
-                            &format!(
-                                "{index}/{total} id={server_id} {server_name} avg={avg:.2}ms std={stddev:.2}"
-                            ),
-                        );
-
-                        let better_than_best = match probe_best.as_ref() {
-                            None => true,
-                            Some((_, _, best_avg, best_stddev)) => {
-                                let avg_better = avg < *best_avg;
-                                let avg_tied = (avg - *best_avg).abs() <= 0.000_1;
-                                avg_better || (avg_tied && stddev < *best_stddev)
-                            }
-                        };
-
-                        if better_than_best {
-                            probe_best = Some((server_id, server_name.to_string(), avg, stddev));
-                        }
-
-                        if let Some((best_id, best_name, best_avg, best_stddev)) = probe_best.as_ref()
-                        {
-                            ui.render_metric(
-                                "probe_best",
-                                &format!(
-                                    "id={best_id} {best_name} avg={best_avg:.2}ms std={best_stddev:.2}"
-                                ),
-                            );
-                        }
-                    } else {
-                        probe_failed = probe_failed.saturating_add(1);
-                        let reason = error.as_deref().unwrap_or("probe failed");
-                        ui.render_metric(
-                            "probe_current",
-                            &format!("{index}/{total} id={server_id} {server_name} failed ({reason})"),
-                        );
-                    }
-
-                    ui.render_metric(
-                        "probe_progress",
-                        &format!("{probe_completed}/{total} complete ({probe_failed} failed)"),
-                    );
-                }
-                engine::EngineEvent::ServerSelected {
-                    server_id,
-                    average_ms,
-                    variance_ms,
-                } => {
-                    let stddev = variance_ms.max(0.0).sqrt();
-                    let server_name = server_names
-                        .get(&server_id)
-                        .map(String::as_str)
-                        .unwrap_or("unknown");
-                    ui.render_metric(
-                        "selected_server",
-                        &format!("id={server_id} {server_name} avg={average_ms:.2}ms std={stddev:.2}"),
-                    );
-                }
-                engine::EngineEvent::StageProgress {
-                    stage,
-                    elapsed,
-                    mbps,
-                    bytes,
-                    active_connections,
-                    rtt_ms,
-                } => {
-                    let _ = active_connections;
-                    let sample = ui::SpeedProgressSample {
-                        elapsed,
-                        mbps,
-                        bytes,
-                        rtt_ms,
-                    };
-                    match stage {
-                        engine::EngineStage::Download => {
-                            download_last = Some((mbps, bytes));
-                            if let Some(progress) = download_progress.as_ref() {
-                                ui.update_speed_progress(progress, sample);
-                            }
-                        }
-                        engine::EngineStage::Upload => {
-                            upload_last = Some((mbps, bytes));
-                            if let Some(progress) = upload_progress.as_ref() {
-                                ui.update_speed_progress(progress, sample);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                engine::EngineEvent::StageResult { stage, mbps, bytes } => match stage {
-                    engine::EngineStage::Download => {
-                        download_last = Some((mbps, bytes));
-                    }
-                    engine::EngineStage::Upload => {
-                        upload_last = Some((mbps, bytes));
-                    }
-                    _ => {}
-                },
-                engine::EngineEvent::StageFinished(stage) => match stage {
-                    engine::EngineStage::Download => {
-                        if let Some(progress) = download_progress.take() {
-                            let (mbps, bytes) = download_last.unwrap_or((0.0, 0));
-                            ui.finish_speed_progress(progress, "download", mbps, bytes);
-                        }
-                    }
-                    engine::EngineStage::Upload => {
-                        if let Some(progress) = upload_progress.take() {
-                            let (mbps, bytes) = upload_last.unwrap_or((0.0, 0));
-                            ui.finish_speed_progress(progress, "upload", mbps, bytes);
-                        }
-                    }
-                    _ => {}
-                },
-                engine::EngineEvent::SavePayloadBuilt { guid, hash } => {
-                    ui.render_metric(
-                        "save",
-                        &format!("guid={} hash={}", guid, &hash[..hash.len().min(12)]),
-                    );
-                }
-            }
-        },
+        |event| ui.handle_engine_event(event),
     ))
     .await;
 
