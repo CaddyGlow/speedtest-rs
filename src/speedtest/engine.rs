@@ -11,18 +11,17 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::model::{
-    BenchmarkResult, ClientMeta, DirectionDetails, MstBucketOut, MstSpeedsOut, RunDetails,
-    RunResult, SdkArtifacts, SelectedServerLatencyDetails, Server, ThroughputInterval,
+    BenchmarkResult, ClientMeta, MstBucketOut, MstSpeedsOut, RunDetails, RunResult, SdkArtifacts,
+    SelectedServerLatencyDetails, Server, ThroughputInterval,
 };
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::config::SpeedtestConfig;
-use crate::speedtest::download::{self, DownloadProgress};
-use crate::speedtest::sdk_payload;
+use crate::speedtest::engine_stages::{
+    finalize_engine_outcome, run_download_stage, run_upload_stage,
+};
 use crate::speedtest::select::{self, LatencyMeasurement, ServerLatency};
 use crate::speedtest::servers::SpeedtestServer;
-use crate::speedtest::throughput::TransferConfig;
-use crate::speedtest::upload::{self, UploadProgress};
-use crate::util::clamp_worker_count;
+use crate::speedtest::download;
 
 #[cfg(test)]
 const RESULT_HASH_SALT: &str = "817d699764d33f89c";
@@ -178,6 +177,18 @@ struct StageMachine {
     remaining: VecDeque<EngineStage>,
 }
 
+pub(crate) struct EngineInputs<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) mode: TransportProtocol,
+    pub(crate) settings: &'a EngineSettings,
+    pub(crate) selection: &'a SelectionOutcome,
+}
+
+pub(crate) struct EngineState {
+    pub(crate) result: RunResult,
+    pub(crate) sdk_artifacts: SdkArtifacts,
+}
+
 impl StageMachine {
     fn new(stages: Vec<EngineStage>) -> Self {
         Self {
@@ -214,50 +225,35 @@ where
         variance_ms: selection.selected.variance_ms,
     });
 
-    let mut result = build_initial_run_result(config, mode, settings, &selection)?;
-    let mut sdk_artifacts = build_initial_sdk_artifacts(&selection);
+    let inputs = EngineInputs {
+        client,
+        mode,
+        settings,
+        selection: &selection,
+    };
+    let mut state = EngineState {
+        result: build_initial_run_result(config, mode, settings, &selection)?,
+        sdk_artifacts: build_initial_sdk_artifacts(&selection),
+    };
 
     let mut stage_machine = StageMachine::new(settings.stage_order());
     while let Some(stage) = stage_machine.next() {
         on_event(EngineEvent::StageStarting(stage));
         match stage {
             EngineStage::Latency => {
-                result.ping_ms = Some(selection.selected.average_ms);
+                state.result.ping_ms = Some(selection.selected.average_ms);
                 on_event(EngineEvent::StageFinished(EngineStage::Latency));
             }
             EngineStage::Download => {
-                run_download_stage(
-                    client,
-                    mode,
-                    settings,
-                    &selection,
-                    &mut result,
-                    &mut sdk_artifacts,
-                    &mut on_event,
-                )
-                .await?;
+                run_download_stage(&inputs, &mut state, &mut on_event).await?;
                 on_event(EngineEvent::StageFinished(EngineStage::Download));
             }
             EngineStage::Upload => {
-                run_upload_stage(
-                    client,
-                    mode,
-                    settings,
-                    &selection,
-                    &mut result,
-                    &mut sdk_artifacts,
-                    &mut on_event,
-                )
-                .await?;
+                run_upload_stage(&inputs, &mut state, &mut on_event).await?;
                 on_event(EngineEvent::StageFinished(EngineStage::Upload));
             }
             EngineStage::Save => {
-                return finalize_engine_outcome(
-                    result,
-                    sdk_artifacts,
-                    selection,
-                    &mut on_event,
-                );
+                return finalize_engine_outcome(state, selection, &mut on_event);
             }
             EngineStage::ServerSelection | EngineStage::Finished => {
                 bail!("unexpected stage in stage machine: {stage:?}");
@@ -268,258 +264,10 @@ where
     bail!("save stage did not execute")
 }
 
-fn finalize_engine_outcome<F>(
-    result: RunResult,
-    sdk_artifacts: SdkArtifacts,
-    selection: SelectionOutcome,
-    on_event: &mut F,
-) -> Result<EngineOutcome>
-where
-    F: FnMut(EngineEvent),
-{
-    let guid = selection
-        .selected
-        .server
-        .session_guid
-        .clone()
-        .unwrap_or_else(sdk_payload::generate_sdk_guid);
-    let payload = sdk_payload::build_sdk_result_payload(&result, &sdk_artifacts, &guid)
-        .context("failed building SDK payload during save stage")?;
-
-    let hash = payload
-        .get("hash")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    on_event(EngineEvent::SavePayloadBuilt { guid, hash });
-    on_event(EngineEvent::StageFinished(EngineStage::Save));
-    on_event(EngineEvent::StageStarting(EngineStage::Finished));
-    on_event(EngineEvent::StageFinished(EngineStage::Finished));
-
-    Ok(EngineOutcome {
-        result,
-        sdk_artifacts,
-        sdk_payload: payload,
-        selected_server: selection.selected.server,
-        selected_latency: LatencyMeasurement {
-            average_ms: selection.selected.average_ms,
-            variance_ms: selection.selected.variance_ms,
-            samples_ms: selection.selected.samples_ms,
-        },
-        transfer_pool: selection.transfer_pool,
-    })
-}
-
-async fn run_download_stage<F>(
-    client: &Client,
-    mode: TransportProtocol,
-    settings: &EngineSettings,
-    selection: &SelectionOutcome,
-    result: &mut RunResult,
-    sdk_artifacts: &mut SdkArtifacts,
-    on_event: &mut F,
-) -> Result<()>
-where
-    F: FnMut(EngineEvent),
-{
-    let mut intervals = Vec::new();
-    let (download_rtt_rx, latency_task) =
-        spawn_loaded_latency_task(client, &selection.selected.server, settings.download_seconds);
-
-    let download_config = TransferConfig {
-        connections: clamp_worker_count(settings.download_connections),
-        initial_connections: 4,
-        max_seconds: settings.download_seconds,
-        progress_interval: settings.progress_interval,
-        request_target_ms: 5_000,
-        start_request_size: 25_000_000,
-        min_request_size: 25_000_000,
-        max_request_size: 250_000_000,
-    };
-    let stats = download::run_download_test(
-        client,
-        &selection.selected.server,
-        mode,
-        &selection.transfer_pool,
-        &download_config,
-        |snapshot: DownloadProgress| {
-            on_event(EngineEvent::StageProgress {
-                stage: EngineStage::Download,
-                elapsed: snapshot.elapsed,
-                mbps: snapshot.mbps,
-                bytes: snapshot.bytes,
-                active_connections: snapshot.active_connections,
-                rtt_ms: *download_rtt_rx.borrow(),
-            });
-            push_interval(
-                &mut intervals,
-                snapshot
-                    .elapsed
-                    .as_secs_f64()
-                    .min(settings.download_seconds as f64),
-                snapshot.bytes,
-                snapshot.mbps,
-            );
-        },
-    )
-    .await?;
-
-    let download_latency_samples = latency_task.await.unwrap_or_default();
-    result.download_latency_ms = average_latency_ms(&download_latency_samples);
-    sdk_artifacts.download_latency_samples_ms =
-        (!download_latency_samples.is_empty()).then_some(download_latency_samples);
-
-    push_interval(
-        &mut intervals,
-        settings.download_seconds as f64,
-        stats.bytes,
-        stats.mbps,
-    );
-
-    result.download = Some(build_benchmark_result(
-        stats.mbps,
-        stats.bytes,
-        settings.download_seconds,
-        download_config.connections,
-        stats.actual_duration_ms,
-        stats.throughput.as_ref(),
-    ));
-    sdk_artifacts.download_intervals = (!intervals.is_empty()).then_some(intervals.clone());
-
-    if let Some(details) = result.details.as_mut() {
-        details.download = Some(DirectionDetails {
-            request_attempts: stats.request_attempts,
-            request_successes: stats.request_successes,
-            request_http_errors: stats.request_http_errors,
-            request_transport_errors: stats.request_transport_errors,
-            response_read_errors: stats.response_read_errors,
-            intervals,
-            remote_intervals: None,
-            mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
-            mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
-        });
-    }
-
-    apply_download_stats_to_server_pool(&mut result.server_pool, &stats.per_server);
-
-    on_event(EngineEvent::StageResult {
-        stage: EngineStage::Download,
-        mbps: stats.mbps,
-        bytes: stats.bytes,
-    });
-
-    Ok(())
-}
-
-async fn run_upload_stage<F>(
-    client: &Client,
-    mode: TransportProtocol,
-    settings: &EngineSettings,
-    selection: &SelectionOutcome,
-    result: &mut RunResult,
-    sdk_artifacts: &mut SdkArtifacts,
-    on_event: &mut F,
-) -> Result<()>
-where
-    F: FnMut(EngineEvent),
-{
-    let mut intervals = Vec::new();
-    let (upload_rtt_rx, latency_task) =
-        spawn_loaded_latency_task(client, &selection.selected.server, settings.upload_seconds);
-
-    let upload_config = TransferConfig {
-        connections: clamp_worker_count(settings.upload_connections),
-        initial_connections: clamp_worker_count(settings.upload_connections),
-        max_seconds: settings.upload_seconds,
-        progress_interval: settings.progress_interval,
-        request_target_ms: 1_000,
-        start_request_size: 1_048_576,
-        min_request_size: 32 * 1024,
-        max_request_size: 25 * 1024 * 1024,
-    };
-    let stats = upload::run_upload_test(
-        client,
-        &selection.selected.server,
-        mode,
-        &selection.transfer_pool,
-        &upload_config,
-        |snapshot: UploadProgress| {
-            on_event(EngineEvent::StageProgress {
-                stage: EngineStage::Upload,
-                elapsed: snapshot.elapsed,
-                mbps: snapshot.mbps,
-                bytes: snapshot.bytes,
-                active_connections: snapshot.active_connections,
-                rtt_ms: *upload_rtt_rx.borrow(),
-            });
-            push_interval(
-                &mut intervals,
-                snapshot
-                    .elapsed
-                    .as_secs_f64()
-                    .min(settings.upload_seconds as f64),
-                snapshot.bytes,
-                snapshot.mbps,
-            );
-        },
-    )
-    .await?;
-
-    let upload_latency_samples = latency_task.await.unwrap_or_default();
-    result.upload_latency_ms = average_latency_ms(&upload_latency_samples);
-    sdk_artifacts.upload_latency_samples_ms =
-        (!upload_latency_samples.is_empty()).then_some(upload_latency_samples);
-
-    push_interval(
-        &mut intervals,
-        settings.upload_seconds as f64,
-        stats.bytes,
-        stats.mbps,
-    );
-
-    let remote_intervals =
-        build_remote_upload_intervals(&stats.remote_samples, settings.upload_seconds);
-
-    result.upload = Some(build_benchmark_result(
-        stats.mbps,
-        stats.bytes,
-        settings.upload_seconds,
-        upload_config.connections,
-        stats.actual_duration_ms,
-        stats.throughput.as_ref(),
-    ));
-    sdk_artifacts.upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
-    sdk_artifacts.upload_remote_intervals =
-        (!remote_intervals.is_empty()).then_some(remote_intervals.clone());
-
-    if let Some(details) = result.details.as_mut() {
-        details.upload = Some(DirectionDetails {
-            request_attempts: stats.request_attempts,
-            request_successes: stats.request_successes,
-            request_http_errors: stats.request_http_errors,
-            request_transport_errors: stats.request_transport_errors,
-            response_read_errors: stats.response_read_errors,
-            intervals,
-            remote_intervals: (!remote_intervals.is_empty()).then_some(remote_intervals),
-            mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
-            mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
-        });
-    }
-
-    on_event(EngineEvent::StageResult {
-        stage: EngineStage::Upload,
-        mbps: stats.mbps,
-        bytes: stats.bytes,
-    });
-
-    Ok(())
-}
-
-struct SelectionOutcome {
-    selected: ServerLatency,
-    transfer_pool: Vec<SpeedtestServer>,
-    latency_by_server: HashMap<u64, (f64, f64)>,
+pub(crate) struct SelectionOutcome {
+    pub(crate) selected: ServerLatency,
+    pub(crate) transfer_pool: Vec<SpeedtestServer>,
+    pub(crate) latency_by_server: HashMap<u64, (f64, f64)>,
 }
 
 fn build_initial_run_result(
@@ -590,7 +338,7 @@ fn build_initial_sdk_artifacts(selection: &SelectionOutcome) -> SdkArtifacts {
     }
 }
 
-fn spawn_loaded_latency_task(
+pub(crate) fn spawn_loaded_latency_task(
     client: &Client,
     server: &SpeedtestServer,
     stage_seconds: u64,
@@ -616,11 +364,11 @@ fn spawn_loaded_latency_task(
     (rtt_rx, task)
 }
 
-fn average_latency_ms(samples: &[f64]) -> Option<f64> {
+pub(crate) fn average_latency_ms(samples: &[f64]) -> Option<f64> {
     (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
 }
 
-fn build_benchmark_result(
+pub(crate) fn build_benchmark_result(
     mbps: f64,
     bytes: u64,
     duration_seconds: u64,
@@ -639,7 +387,7 @@ fn build_benchmark_result(
     }
 }
 
-fn build_mst_speeds(
+pub(crate) fn build_mst_speeds(
     throughput: Option<&crate::speedtest::throughput::ThroughputResult>,
 ) -> Option<MstSpeedsOut> {
     throughput.map(|t| MstSpeedsOut {
@@ -652,7 +400,7 @@ fn build_mst_speeds(
     })
 }
 
-fn build_mst_buckets(
+pub(crate) fn build_mst_buckets(
     throughput: Option<&crate::speedtest::throughput::ThroughputResult>,
 ) -> Option<Vec<MstBucketOut>> {
     throughput.map(|t| {
@@ -668,7 +416,7 @@ fn build_mst_buckets(
     })
 }
 
-fn build_remote_upload_intervals(
+pub(crate) fn build_remote_upload_intervals(
     samples: &[crate::speedtest::browser_protocol::UploadStatsSample],
     stage_seconds: u64,
 ) -> Vec<ThroughputInterval> {
@@ -694,7 +442,7 @@ fn build_remote_upload_intervals(
     intervals
 }
 
-fn apply_download_stats_to_server_pool(
+pub(crate) fn apply_download_stats_to_server_pool(
     server_pool: &mut Option<Vec<Server>>,
     per_server: &[download::PerServerDownloadStats],
 ) {
@@ -861,7 +609,7 @@ fn map_server(
     }
 }
 
-fn push_interval(
+pub(crate) fn push_interval(
     intervals: &mut Vec<ThroughputInterval>,
     elapsed_seconds: f64,
     bytes: u64,

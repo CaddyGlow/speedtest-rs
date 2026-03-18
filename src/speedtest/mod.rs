@@ -3,6 +3,7 @@ pub mod browser_protocol;
 pub mod config;
 pub mod download;
 pub mod engine;
+pub mod engine_stages;
 pub mod ipinfo;
 pub mod modern_protocol;
 pub mod sdk_payload;
