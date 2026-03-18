@@ -105,7 +105,7 @@ pub(super) fn build_direction_samples(
         return Ok(None);
     };
 
-    let bps = super::mbps_to_bps(fallback)?;
+    let bps = super::util::mbps_to_bps(fallback)?;
     Ok(Some(vec![SdkThroughputSample {
         elapsed: fallback.duration_seconds as f64,
         bytes: fallback.bytes,

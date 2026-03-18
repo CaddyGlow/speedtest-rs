@@ -1,53 +1,24 @@
 mod latency;
 mod metadata;
+mod prepare;
 mod selection;
 mod throughput;
 mod types;
+mod util;
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use tracing::debug;
 
-use crate::model::{BenchmarkResult, RunResult, SdkArtifacts};
+use crate::model::{RunResult, SdkArtifacts};
 
-use self::latency::{
-    calculate_jitter_ms, build_latency_payload, latency_stats, selected_latency_samples,
-};
-use self::metadata::{
-    build_sdk_app, build_sdk_configs, build_sdk_location, build_supplemental_data,
-    infer_protocols, split_client_ips,
-};
-use self::selection::{
-    build_server_list_entry, build_server_selection, parse_host_and_port,
-};
-use self::throughput::{
-    SdkDirectionSpeeds, build_direction_samples, build_speed_profile,
-    direction_samples_from_intervals, local_upload_bps, remote_upload_bps,
-};
-use self::types::{PreparedSdkMeasurements, SdkPayload};
+use self::metadata::{build_sdk_app, build_sdk_configs, build_sdk_location};
+use self::prepare::prepare_sdk_measurements;
+use self::selection::{build_server_list_entry, parse_host_and_port};
+use self::types::SdkPayload;
 
-static GUID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[must_use]
-pub fn generate_sdk_guid() -> String {
-    let counter = GUID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0);
-
-    let part1 = (now_nanos >> 32) as u32;
-    let part2 = ((now_nanos >> 16) & 0xffff) as u16;
-    let part3 = (now_nanos & 0xffff) as u16;
-    let part4 = ((counter >> 48) & 0xffff) as u16;
-    let part5 = (counter & 0xffffffffffff) ^ (now_nanos & 0xffffffffffff);
-
-    format!("{part1:08x}-{part2:04x}-{part3:04x}-{part4:04x}-{part5:012x}")
-}
+pub(crate) use self::util::generate_sdk_guid;
 
 pub fn write_sdk_result_json_file(
     result: &RunResult,
@@ -145,185 +116,6 @@ pub fn build_sdk_result_payload(
 
     Ok(serde_json::to_value(payload)?)
 }
-
-fn mbps_to_bps(result: &BenchmarkResult) -> Result<u64> {
-    if !result.mbps.is_finite() || result.mbps < 0.0 {
-        bail!("throughput Mbps must be a finite non-negative number");
-    }
-    Ok((result.mbps * 1_000_000.0).round() as u64)
-}
-
-fn bps_to_sdk_units(bps: u64) -> u64 {
-    ((bps as f64) / 125.0).round() as u64
-}
-
-fn calculate_result_hash(ping: f64, upload: Option<u64>, download: Option<u64>) -> String {
-    let ping = if ping.is_finite() { ping } else { 0.0 };
-    let upload = upload.unwrap_or(0);
-    let download = download.unwrap_or(0);
-    let hash_input = format!("{ping}-{upload}-{download}-817d699764d33f89c");
-    format!("{:x}", md5::compute(hash_input))
-}
-
-fn prepare_sdk_measurements(
-    result: &RunResult,
-    sdk_artifacts: &SdkArtifacts,
-    server: &crate::model::Server,
-    ping_ms: f64,
-) -> Result<PreparedSdkMeasurements> {
-    let protocols = infer_protocols(result.speedtest_api.as_deref());
-    let pings = selected_latency_samples(result, sdk_artifacts).unwrap_or_else(|| vec![ping_ms]);
-    let ping = latency_stats(&pings)
-        .map(|stats| stats.min)
-        .unwrap_or(ping_ms);
-    let jitter = calculate_jitter_ms(&pings);
-    let download_bps = result.download.as_ref().map(mbps_to_bps).transpose()?;
-    let upload_effective_bps = result.upload.as_ref().map(mbps_to_bps).transpose()?;
-    let upload_local_bps = if upload_effective_bps.is_some() {
-        local_upload_bps(result, sdk_artifacts).or(upload_effective_bps)
-    } else {
-        None
-    };
-    let upload_remote_bps = remote_upload_bps(result, sdk_artifacts);
-    let download_latency_samples = sdk_artifacts
-        .download_latency_samples_ms
-        .clone()
-        .filter(|samples| !samples.is_empty())
-        .unwrap_or_else(|| pings.clone());
-    let upload_latency_samples = sdk_artifacts
-        .upload_latency_samples_ms
-        .clone()
-        .filter(|samples| !samples.is_empty())
-        .unwrap_or_else(|| pings.clone());
-    let latency =
-        build_latency_payload(&pings, jitter, protocols.latency_connection_protocol, true);
-    let download_latency = result.download.as_ref().and_then(|_| {
-        build_latency_payload(
-            &download_latency_samples,
-            calculate_jitter_ms(&download_latency_samples),
-            protocols.download_connection_protocol,
-            false,
-        )
-    });
-    let upload_latency = result.upload.as_ref().and_then(|_| {
-        build_latency_payload(
-            &upload_latency_samples,
-            calculate_jitter_ms(&upload_latency_samples),
-            protocols.upload_connection_protocol,
-            false,
-        )
-    });
-    let download_samples = if download_bps.is_some() {
-        build_direction_samples(
-            sdk_artifacts.download_intervals.as_deref(),
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.download.as_ref()),
-            result.download.as_ref(),
-        )?
-    } else {
-        None
-    };
-    let upload_samples = if upload_effective_bps.is_some() {
-        build_direction_samples(
-            sdk_artifacts.upload_intervals.as_deref(),
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.upload.as_ref()),
-            result.upload.as_ref(),
-        )?
-    } else {
-        None
-    };
-    let upload_remote_samples = sdk_artifacts
-        .upload_remote_intervals
-        .as_deref()
-        .and_then(direction_samples_from_intervals);
-    let download_speed_profile = build_speed_profile(
-        download_bps,
-        download_samples.as_deref(),
-        result.download.as_ref().map(|stats| stats.duration_seconds),
-    );
-    let upload_local_speed_profile = build_speed_profile(
-        upload_local_bps,
-        upload_samples.as_deref(),
-        result.upload.as_ref().map(|stats| stats.duration_seconds),
-    );
-    let upload_remote_speed_profile = build_speed_profile(
-        upload_remote_bps,
-        upload_remote_samples.as_deref(),
-        result.upload.as_ref().map(|stats| stats.duration_seconds),
-    );
-    let download = download_speed_profile
-        .as_ref()
-        .map(|profile| bps_to_sdk_units(profile.combined))
-        .or(download_bps.map(bps_to_sdk_units));
-    let upload = upload_remote_speed_profile
-        .as_ref()
-        .or(upload_local_speed_profile.as_ref())
-        .map(|profile| bps_to_sdk_units(profile.combined))
-        .or(upload_effective_bps.map(bps_to_sdk_units));
-    let upload_measurement_method = if upload_remote_speed_profile.is_some() {
-        "remote"
-    } else {
-        "local"
-    };
-
-    debug!(
-        upload_effective_bps = ?upload_effective_bps,
-        upload_local_bps = ?upload_local_bps,
-        upload_remote_bps = ?upload_remote_bps,
-        upload_sample_count = upload_samples.as_ref().map(|samples| samples.len()).unwrap_or(0),
-        upload_remote_sample_count = upload_remote_samples
-            .as_ref()
-            .map(|samples| samples.len())
-            .unwrap_or(0),
-        upload_measurement_method,
-        "building sdk upload speed profiles"
-    );
-
-    let (clientip, ip6_address) = result
-        .client
-        .as_ref()
-        .map(|client| split_client_ips(&client.ip))
-        .unwrap_or((None, None));
-    let server_selection = build_server_selection(result, server, ping);
-    let supplemental_data = build_supplemental_data(result)?;
-    let upload_speeds = upload_effective_bps.map(|_| SdkDirectionSpeeds {
-        local: upload_local_speed_profile,
-        remote: upload_remote_speed_profile,
-    });
-    let download_speeds = download_bps.map(|_| SdkDirectionSpeeds {
-        local: download_speed_profile,
-        remote: None,
-    });
-    let hash = calculate_result_hash(ping, upload, download);
-
-    Ok(PreparedSdkMeasurements {
-        protocols,
-        ping,
-        pings,
-        jitter,
-        latency,
-        download_latency,
-        upload_latency,
-        download,
-        upload,
-        download_samples,
-        upload_samples,
-        download_speeds,
-        upload_speeds,
-        server_selection,
-        upload_measurement_method,
-        clientip,
-        ip6_address,
-        supplemental_data,
-        hash,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{build_sdk_result_payload, write_sdk_result_json_file};
