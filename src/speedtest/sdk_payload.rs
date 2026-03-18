@@ -2,6 +2,7 @@ mod latency;
 mod metadata;
 mod selection;
 mod throughput;
+mod types;
 
 use std::fs;
 use std::path::Path;
@@ -9,27 +10,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
-use serde_json::Value;
 use tracing::debug;
 
 use crate::model::{BenchmarkResult, RunResult, SdkArtifacts};
 
 use self::latency::{
-    SdkLatencyPayload, calculate_jitter_ms, build_latency_payload, latency_stats,
-    selected_latency_samples,
+    calculate_jitter_ms, build_latency_payload, latency_stats, selected_latency_samples,
 };
 use self::metadata::{
-    SdkApp, SdkConfigs, SdkLocation, build_sdk_app, build_sdk_configs, build_sdk_location,
-    build_supplemental_data, infer_protocols, split_client_ips,
+    build_sdk_app, build_sdk_configs, build_sdk_location, build_supplemental_data,
+    infer_protocols, split_client_ips,
 };
 use self::selection::{
-    SdkServerSelection, build_server_list_entry, build_server_selection, parse_host_and_port,
+    build_server_list_entry, build_server_selection, parse_host_and_port,
 };
 use self::throughput::{
-    SdkDirectionSpeeds, SdkThroughputSample, build_direction_samples, build_speed_profile,
+    SdkDirectionSpeeds, build_direction_samples, build_speed_profile,
     direction_samples_from_intervals, local_upload_bps, remote_upload_bps,
 };
+use self::types::{PreparedSdkMeasurements, SdkPayload};
 
 static GUID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -323,79 +322,6 @@ fn prepare_sdk_measurements(
         supplemental_data,
         hash,
     })
-}
-
-struct PreparedSdkMeasurements {
-    protocols: self::metadata::SdkProtocols,
-    ping: f64,
-    pings: Vec<f64>,
-    jitter: f64,
-    latency: Option<SdkLatencyPayload>,
-    download_latency: Option<SdkLatencyPayload>,
-    upload_latency: Option<SdkLatencyPayload>,
-    download: Option<u64>,
-    upload: Option<u64>,
-    download_samples: Option<Vec<SdkThroughputSample>>,
-    upload_samples: Option<Vec<SdkThroughputSample>>,
-    download_speeds: Option<SdkDirectionSpeeds>,
-    upload_speeds: Option<SdkDirectionSpeeds>,
-    server_selection: Option<SdkServerSelection>,
-    upload_measurement_method: &'static str,
-    clientip: Option<String>,
-    ip6_address: Option<String>,
-    supplemental_data: Value,
-    hash: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkPayload {
-    app: SdkApp,
-    serverid: u64,
-    testmethod: String,
-    source: String,
-    configs: SdkConfigs,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<SdkLocation>,
-    #[serde(rename = "ispName")]
-    isp_name: String,
-    ping: f64,
-    pings: Vec<f64>,
-    jitter: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    latency: Option<SdkLatencyPayload>,
-    guid: String,
-    #[serde(rename = "serverSelectionGuid")]
-    server_selection_guid: String,
-    #[serde(rename = "serverSelectionMethod")]
-    server_selection_method: String,
-    #[serde(rename = "serverSelection", skip_serializing_if = "Option::is_none")]
-    server_selection: Option<SdkServerSelection>,
-    #[serde(rename = "uploadMeasurementMethod")]
-    upload_measurement_method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    upload: Option<u64>,
-    #[serde(rename = "uploadSpeeds", skip_serializing_if = "Option::is_none")]
-    upload_speeds: Option<SdkDirectionSpeeds>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    download: Option<u64>,
-    #[serde(rename = "downloadSpeeds", skip_serializing_if = "Option::is_none")]
-    download_speeds: Option<SdkDirectionSpeeds>,
-    #[serde(rename = "downloadLatency", skip_serializing_if = "Option::is_none")]
-    download_latency: Option<SdkLatencyPayload>,
-    #[serde(rename = "uploadLatency", skip_serializing_if = "Option::is_none")]
-    upload_latency: Option<SdkLatencyPayload>,
-    #[serde(rename = "supplementalData")]
-    supplemental_data: Value,
-    #[serde(rename = "downloadSamples", skip_serializing_if = "Option::is_none")]
-    download_samples: Option<Vec<SdkThroughputSample>>,
-    #[serde(rename = "uploadSamples", skip_serializing_if = "Option::is_none")]
-    upload_samples: Option<Vec<SdkThroughputSample>>,
-    spoofed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    clientip: Option<String>,
-    #[serde(rename = "ip6Address", skip_serializing_if = "Option::is_none")]
-    ip6_address: Option<String>,
-    hash: String,
 }
 
 #[cfg(test)]
