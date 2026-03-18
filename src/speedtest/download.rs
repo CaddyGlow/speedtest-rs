@@ -55,6 +55,29 @@ pub struct DownloadProgress {
     pub active_connections: usize,
 }
 
+struct DownloadWorkerShared<'a> {
+    server_pool: &'a [SpeedtestServer],
+    total_bytes: &'a Arc<AtomicU64>,
+    request_attempts: &'a Arc<AtomicU64>,
+    request_successes: &'a Arc<AtomicU64>,
+    request_transport_errors: &'a Arc<AtomicU64>,
+    response_read_errors: &'a Arc<AtomicU64>,
+    active_connections: &'a Arc<AtomicUsize>,
+    per_server_bytes: &'a Arc<Vec<AtomicU64>>,
+    target_workers: &'a Arc<AtomicUsize>,
+    suggested_size: &'a Arc<AtomicUsize>,
+    first_byte_at: &'a Arc<OnceLock<Instant>>,
+    stop_rx: &'a watch::Receiver<bool>,
+    first_transfer_tx: &'a watch::Sender<bool>,
+}
+
+struct DownloadBrowserWorkerShared<'a> {
+    common: DownloadWorkerShared<'a>,
+    client: &'a Client,
+    default_guid: &'a str,
+    request_http_errors: &'a Arc<AtomicU64>,
+}
+
 pub async fn run_download_test<F>(
     client: &Client,
     selected_server: &SpeedtestServer,
@@ -88,47 +111,47 @@ where
     );
     let mut runtime =
         new_transfer_stage_runtime(worker_count, config.start_request_size, config.max_seconds);
+    let worker_shared = DownloadWorkerShared {
+        server_pool: &ready_pool,
+        total_bytes: &total_bytes,
+        request_attempts: &request_attempts,
+        request_successes: &request_successes,
+        request_transport_errors: &request_transport_errors,
+        response_read_errors: &response_read_errors,
+        active_connections: &active_connections,
+        per_server_bytes: &per_server_bytes,
+        target_workers: &runtime.target_workers,
+        suggested_size: &runtime.suggested_size,
+        first_byte_at: &runtime.first_byte_at,
+        stop_rx: &runtime.stage_stop_rx,
+        first_transfer_tx: &runtime.first_transfer_tx,
+    };
+    let browser_worker_shared = DownloadBrowserWorkerShared {
+        common: DownloadWorkerShared {
+            server_pool: &ready_pool,
+            total_bytes: &total_bytes,
+            request_attempts: &request_attempts,
+            request_successes: &request_successes,
+            request_transport_errors: &request_transport_errors,
+            response_read_errors: &response_read_errors,
+            active_connections: &active_connections,
+            per_server_bytes: &per_server_bytes,
+            target_workers: &runtime.target_workers,
+            suggested_size: &runtime.suggested_size,
+            first_byte_at: &runtime.first_byte_at,
+            stop_rx: &runtime.stage_stop_rx,
+            first_transfer_tx: &runtime.first_transfer_tx,
+        },
+        client,
+        default_guid: &default_guid,
+        request_http_errors: &request_http_errors,
+    };
     spawn_worker_range(
         0..worker_count,
         &mut runtime.tasks,
         |idx, tasks| match mode {
-            TransportProtocol::Tcp => spawn_download_worker_tcp(
-                idx,
-                &ready_pool,
-                &total_bytes,
-                &request_attempts,
-                &request_successes,
-                &request_transport_errors,
-                &response_read_errors,
-                &active_connections,
-                &per_server_bytes,
-                &runtime.target_workers,
-                &runtime.suggested_size,
-                &runtime.first_byte_at,
-                &runtime.stage_stop_rx,
-                &runtime.first_transfer_tx,
-                tasks,
-            ),
-            TransportProtocol::Xhr => spawn_download_worker_xhr(
-                idx,
-                client,
-                &ready_pool,
-                &default_guid,
-                &total_bytes,
-                &request_attempts,
-                &request_successes,
-                &request_http_errors,
-                &request_transport_errors,
-                &response_read_errors,
-                &active_connections,
-                &per_server_bytes,
-                &runtime.target_workers,
-                &runtime.suggested_size,
-                &runtime.first_byte_at,
-                &runtime.stage_stop_rx,
-                &runtime.first_transfer_tx,
-                tasks,
-            ),
+            TransportProtocol::Tcp => spawn_download_worker_tcp(idx, &worker_shared, tasks),
+            TransportProtocol::Xhr => spawn_download_worker_xhr(idx, &browser_worker_shared, tasks),
         },
     );
 
@@ -158,43 +181,10 @@ where
                 return;
             }
             spawn_worker_range(range, tasks, |idx, tasks| match mode {
-                TransportProtocol::Tcp => spawn_download_worker_tcp(
-                    idx,
-                    &ready_pool,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                    &per_server_bytes,
-                    &runtime.target_workers,
-                    &runtime.suggested_size,
-                    &runtime.first_byte_at,
-                    &runtime.stage_stop_rx,
-                    &runtime.first_transfer_tx,
-                    tasks,
-                ),
-                TransportProtocol::Xhr => spawn_download_worker_xhr(
-                    idx,
-                    client,
-                    &ready_pool,
-                    &default_guid,
-                    &total_bytes,
-                    &request_attempts,
-                    &request_successes,
-                    &request_http_errors,
-                    &request_transport_errors,
-                    &response_read_errors,
-                    &active_connections,
-                    &per_server_bytes,
-                    &runtime.target_workers,
-                    &runtime.suggested_size,
-                    &runtime.first_byte_at,
-                    &runtime.stage_stop_rx,
-                    &runtime.first_transfer_tx,
-                    tasks,
-                ),
+                TransportProtocol::Tcp => spawn_download_worker_tcp(idx, &worker_shared, tasks),
+                TransportProtocol::Xhr => {
+                    spawn_download_worker_xhr(idx, &browser_worker_shared, tasks)
+                }
             });
         },
         |elapsed, bytes, mbps, active_connections| {
@@ -271,38 +261,25 @@ async fn resolve_ready_download_pool(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_download_worker_tcp(
     worker_index: usize,
-    server_pool: &[SpeedtestServer],
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    per_server_bytes: &Arc<Vec<AtomicU64>>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
+    shared: &DownloadWorkerShared<'_>,
     tasks: &mut JoinSet<()>,
 ) {
-    let server_index = worker_index % server_pool.len();
-    let worker_server = server_pool[server_index].clone();
-    let worker_bytes = Arc::clone(total_bytes);
-    let worker_attempts = Arc::clone(request_attempts);
-    let worker_successes = Arc::clone(request_successes);
-    let worker_transport_errors = Arc::clone(request_transport_errors);
-    let worker_read_errors = Arc::clone(response_read_errors);
-    let worker_active_connections = Arc::clone(active_connections);
-    let worker_per_server_bytes = Arc::clone(per_server_bytes);
-    let worker_target = Arc::clone(target_workers);
-    let worker_suggested_size = Arc::clone(suggested_size);
-    let worker_first_byte_at = Arc::clone(first_byte_at);
-    let mut worker_stop = stop_rx.clone();
-    let worker_first_transfer_tx = first_transfer_tx.clone();
+    let server_index = worker_index % shared.server_pool.len();
+    let worker_server = shared.server_pool[server_index].clone();
+    let worker_bytes = Arc::clone(shared.total_bytes);
+    let worker_attempts = Arc::clone(shared.request_attempts);
+    let worker_successes = Arc::clone(shared.request_successes);
+    let worker_transport_errors = Arc::clone(shared.request_transport_errors);
+    let worker_read_errors = Arc::clone(shared.response_read_errors);
+    let worker_active_connections = Arc::clone(shared.active_connections);
+    let worker_per_server_bytes = Arc::clone(shared.per_server_bytes);
+    let worker_target = Arc::clone(shared.target_workers);
+    let worker_suggested_size = Arc::clone(shared.suggested_size);
+    let worker_first_byte_at = Arc::clone(shared.first_byte_at);
+    let mut worker_stop = shared.stop_rx.clone();
+    let worker_first_transfer_tx = shared.first_transfer_tx.clone();
     tasks.spawn(async move {
         let mut stream = None;
         let mut stream_connected = false;
@@ -367,48 +344,32 @@ fn spawn_download_worker_tcp(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_download_worker_xhr(
     worker_index: usize,
-    client: &Client,
-    server_pool: &[SpeedtestServer],
-    default_guid: &str,
-    total_bytes: &Arc<AtomicU64>,
-    request_attempts: &Arc<AtomicU64>,
-    request_successes: &Arc<AtomicU64>,
-    request_http_errors: &Arc<AtomicU64>,
-    request_transport_errors: &Arc<AtomicU64>,
-    response_read_errors: &Arc<AtomicU64>,
-    active_connections: &Arc<AtomicUsize>,
-    per_server_bytes: &Arc<Vec<AtomicU64>>,
-    target_workers: &Arc<AtomicUsize>,
-    suggested_size: &Arc<AtomicUsize>,
-    first_byte_at: &Arc<OnceLock<Instant>>,
-    stop_rx: &watch::Receiver<bool>,
-    first_transfer_tx: &watch::Sender<bool>,
+    shared: &DownloadBrowserWorkerShared<'_>,
     tasks: &mut JoinSet<()>,
 ) {
-    let worker_client = client.clone();
-    let server_index = worker_index % server_pool.len();
-    let worker_server = server_pool[server_index].clone();
-    let worker_default_guid = default_guid.to_string();
+    let worker_client = shared.client.clone();
+    let server_index = worker_index % shared.common.server_pool.len();
+    let worker_server = shared.common.server_pool[server_index].clone();
+    let worker_default_guid = shared.default_guid.to_string();
     let _worker_guid = worker_server
         .session_guid
         .clone()
         .unwrap_or(worker_default_guid);
-    let worker_bytes = Arc::clone(total_bytes);
-    let worker_attempts = Arc::clone(request_attempts);
-    let worker_successes = Arc::clone(request_successes);
-    let worker_http_errors = Arc::clone(request_http_errors);
-    let worker_transport_errors = Arc::clone(request_transport_errors);
-    let worker_read_errors = Arc::clone(response_read_errors);
-    let worker_active_connections = Arc::clone(active_connections);
-    let worker_per_server_bytes = Arc::clone(per_server_bytes);
-    let worker_target = Arc::clone(target_workers);
-    let worker_suggested_size = Arc::clone(suggested_size);
-    let worker_first_byte_at = Arc::clone(first_byte_at);
-    let mut worker_stop = stop_rx.clone();
-    let worker_first_transfer_tx = first_transfer_tx.clone();
+    let worker_bytes = Arc::clone(shared.common.total_bytes);
+    let worker_attempts = Arc::clone(shared.common.request_attempts);
+    let worker_successes = Arc::clone(shared.common.request_successes);
+    let worker_http_errors = Arc::clone(shared.request_http_errors);
+    let worker_transport_errors = Arc::clone(shared.common.request_transport_errors);
+    let worker_read_errors = Arc::clone(shared.common.response_read_errors);
+    let worker_active_connections = Arc::clone(shared.common.active_connections);
+    let worker_per_server_bytes = Arc::clone(shared.common.per_server_bytes);
+    let worker_target = Arc::clone(shared.common.target_workers);
+    let worker_suggested_size = Arc::clone(shared.common.suggested_size);
+    let worker_first_byte_at = Arc::clone(shared.common.first_byte_at);
+    let mut worker_stop = shared.common.stop_rx.clone();
+    let worker_first_transfer_tx = shared.common.first_transfer_tx.clone();
     tasks.spawn(async move {
         while !*worker_stop.borrow_and_update() {
             if worker_index >= worker_target.load(Ordering::Relaxed) {

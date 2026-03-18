@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, IsTerminal};
 
 use crate::iperf::schema::{IperfDirectionOut, IperfJsonV1, IperfProtocolOut};
-use crate::model::RunResult;
+use crate::model::{BenchmarkResult, RunResult};
 
 pub fn print_human(result: &RunResult) {
     let theme = Theme::detect();
@@ -108,7 +108,12 @@ pub fn print_human(result: &RunResult) {
     if let Some(ping) = result.ping_ms {
         let jitter_suffix = result
             .jitter_ms
-            .map(|j| format!(" (jitter {})", theme.paint(&format!("{j:.2}ms"), latency_color(j))))
+            .map(|j| {
+                format!(
+                    " (jitter {})",
+                    theme.paint(&format!("{j:.2}ms"), latency_color(j))
+                )
+            })
             .unwrap_or_default();
         println!(
             "  {} {}{}",
@@ -117,52 +122,18 @@ pub fn print_human(result: &RunResult) {
             jitter_suffix
         );
     }
-    if let Some(download) = &result.download {
-        let latency_suffix = result
-            .download_latency_ms
-            .map(|l| {
-                format!(
-                    " latency {}",
-                    theme.paint(&format!("{l:.2}ms"), latency_color(l))
-                )
-            })
-            .unwrap_or_default();
-        println!(
-            "  {} {}  {} in {}s ({} workers){}",
-            theme.badge("DOWN", throughput_color(download.mbps)),
-            theme.paint(
-                &format!("{:.2} Mbps", download.mbps),
-                throughput_color(download.mbps)
-            ),
-            format_bytes(download.bytes),
-            download.duration_seconds,
-            download.connections,
-            latency_suffix
-        );
-    }
-    if let Some(upload) = &result.upload {
-        let latency_suffix = result
-            .upload_latency_ms
-            .map(|l| {
-                format!(
-                    " latency {}",
-                    theme.paint(&format!("{l:.2}ms"), latency_color(l))
-                )
-            })
-            .unwrap_or_default();
-        println!(
-            "  {} {}  {} in {}s ({} workers){}",
-            theme.badge("UP", throughput_color(upload.mbps)),
-            theme.paint(
-                &format!("{:.2} Mbps", upload.mbps),
-                throughput_color(upload.mbps)
-            ),
-            format_bytes(upload.bytes),
-            upload.duration_seconds,
-            upload.connections,
-            latency_suffix
-        );
-    }
+    print_speedtest_direction(
+        &theme,
+        "DOWN",
+        result.download.as_ref(),
+        result.download_latency_ms,
+    );
+    print_speedtest_direction(
+        &theme,
+        "UP",
+        result.upload.as_ref(),
+        result.upload_latency_ms,
+    );
     println!(
         "  {} {}",
         theme.key("proxy"),
@@ -255,6 +226,41 @@ fn print_iperf_direction(label: &str, result: Option<&IperfDirectionOut>) {
             result.out_of_order
         );
     }
+}
+
+fn print_speedtest_direction(
+    theme: &Theme,
+    label: &str,
+    result: Option<&BenchmarkResult>,
+    latency_ms: Option<f64>,
+) {
+    let Some(result) = result else {
+        return;
+    };
+
+    println!(
+        "  {} {}  {} in {}s ({} workers){}",
+        theme.badge(label, throughput_color(result.mbps)),
+        theme.paint(
+            &format!("{:.2} Mbps", result.mbps),
+            throughput_color(result.mbps)
+        ),
+        format_bytes(result.bytes),
+        result.duration_seconds,
+        result.connections,
+        format_latency_suffix(theme, latency_ms)
+    );
+}
+
+fn format_latency_suffix(theme: &Theme, latency_ms: Option<f64>) -> String {
+    latency_ms
+        .map(|latency_ms| {
+            format!(
+                " latency {}",
+                theme.paint(&format!("{latency_ms:.2}ms"), latency_color(latency_ms))
+            )
+        })
+        .unwrap_or_default()
 }
 
 struct Theme {

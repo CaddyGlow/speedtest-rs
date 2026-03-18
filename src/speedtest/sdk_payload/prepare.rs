@@ -1,15 +1,16 @@
 use anyhow::Result;
 use tracing::debug;
 
-use crate::model::{RunResult, SdkArtifacts, Server};
+use crate::model::{BenchmarkResult, DirectionDetails, RunResult, SdkArtifacts, Server};
 
 use super::latency::{
-    build_latency_payload, calculate_jitter_ms, latency_stats, selected_latency_samples,
+    SdkLatencyPayload, build_latency_payload, calculate_jitter_ms, latency_stats,
+    selected_latency_samples,
 };
 use super::metadata::{build_supplemental_data, infer_protocols, split_client_ips};
 use super::selection::build_server_selection;
 use super::throughput::{
-    SdkDirectionSpeeds, build_direction_samples, build_speed_profile,
+    SdkDirectionSpeeds, SdkThroughputSample, build_direction_samples, build_speed_profile,
     direction_samples_from_intervals, local_upload_bps, remote_upload_bps,
 };
 use super::types::PreparedSdkMeasurements;
@@ -32,11 +33,7 @@ pub(super) fn prepare_sdk_measurements(
         .as_ref()
         .map(util::mbps_to_bps)
         .transpose()?;
-    let upload_effective_bps = result
-        .upload
-        .as_ref()
-        .map(util::mbps_to_bps)
-        .transpose()?;
+    let upload_effective_bps = result.upload.as_ref().map(util::mbps_to_bps).transpose()?;
     let upload_local_bps = if upload_effective_bps.is_some() {
         local_upload_bps(result, sdk_artifacts).or(upload_effective_bps)
     } else {
@@ -55,46 +52,34 @@ pub(super) fn prepare_sdk_measurements(
         .unwrap_or_else(|| pings.clone());
     let latency =
         build_latency_payload(&pings, jitter, protocols.latency_connection_protocol, true);
-    let download_latency = result.download.as_ref().and_then(|_| {
-        build_latency_payload(
-            &download_latency_samples,
-            calculate_jitter_ms(&download_latency_samples),
-            protocols.download_connection_protocol,
-            false,
-        )
-    });
-    let upload_latency = result.upload.as_ref().and_then(|_| {
-        build_latency_payload(
-            &upload_latency_samples,
-            calculate_jitter_ms(&upload_latency_samples),
-            protocols.upload_connection_protocol,
-            false,
-        )
-    });
-    let download_samples = if download_bps.is_some() {
-        build_direction_samples(
-            sdk_artifacts.download_intervals.as_deref(),
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.download.as_ref()),
-            result.download.as_ref(),
-        )?
-    } else {
-        None
-    };
-    let upload_samples = if upload_effective_bps.is_some() {
-        build_direction_samples(
-            sdk_artifacts.upload_intervals.as_deref(),
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.upload.as_ref()),
-            result.upload.as_ref(),
-        )?
-    } else {
-        None
-    };
+    let download_latency = build_optional_direction_latency(
+        result.download.as_ref(),
+        &download_latency_samples,
+        protocols.download_connection_protocol,
+    );
+    let upload_latency = build_optional_direction_latency(
+        result.upload.as_ref(),
+        &upload_latency_samples,
+        protocols.upload_connection_protocol,
+    );
+    let download_samples = build_optional_direction_samples(
+        download_bps.is_some(),
+        sdk_artifacts.download_intervals.as_deref(),
+        result
+            .details
+            .as_ref()
+            .and_then(|details| details.download.as_ref()),
+        result.download.as_ref(),
+    )?;
+    let upload_samples = build_optional_direction_samples(
+        upload_effective_bps.is_some(),
+        sdk_artifacts.upload_intervals.as_deref(),
+        result
+            .details
+            .as_ref()
+            .and_then(|details| details.upload.as_ref()),
+        result.upload.as_ref(),
+    )?;
     let upload_remote_samples = sdk_artifacts
         .upload_remote_intervals
         .as_deref()
@@ -102,17 +87,17 @@ pub(super) fn prepare_sdk_measurements(
     let download_speed_profile = build_speed_profile(
         download_bps,
         download_samples.as_deref(),
-        result.download.as_ref().map(|stats| stats.duration_seconds),
+        direction_duration_seconds(result.download.as_ref()),
     );
     let upload_local_speed_profile = build_speed_profile(
         upload_local_bps,
         upload_samples.as_deref(),
-        result.upload.as_ref().map(|stats| stats.duration_seconds),
+        direction_duration_seconds(result.upload.as_ref()),
     );
     let upload_remote_speed_profile = build_speed_profile(
         upload_remote_bps,
         upload_remote_samples.as_deref(),
-        result.upload.as_ref().map(|stats| stats.duration_seconds),
+        direction_duration_seconds(result.upload.as_ref()),
     );
     let download = download_speed_profile
         .as_ref()
@@ -180,4 +165,36 @@ pub(super) fn prepare_sdk_measurements(
         supplemental_data,
         hash,
     })
+}
+
+fn build_optional_direction_latency(
+    result: Option<&BenchmarkResult>,
+    latency_samples: &[f64],
+    connection_protocol: &'static str,
+) -> Option<SdkLatencyPayload> {
+    result.and_then(|_| {
+        build_latency_payload(
+            latency_samples,
+            calculate_jitter_ms(latency_samples),
+            connection_protocol,
+            false,
+        )
+    })
+}
+
+fn build_optional_direction_samples(
+    enabled: bool,
+    intervals: Option<&[crate::model::ThroughputInterval]>,
+    details: Option<&DirectionDetails>,
+    result: Option<&BenchmarkResult>,
+) -> Result<Option<Vec<SdkThroughputSample>>> {
+    if enabled {
+        build_direction_samples(intervals, details, result)
+    } else {
+        Ok(None)
+    }
+}
+
+fn direction_duration_seconds(result: Option<&BenchmarkResult>) -> Option<u64> {
+    result.map(|stats| stats.duration_seconds)
 }

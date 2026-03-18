@@ -4,16 +4,16 @@ use serde_json::Value;
 use crate::model::DirectionDetails;
 use crate::speedtest::download::{self, DownloadProgress};
 use crate::speedtest::sdk_payload;
-use crate::speedtest::throughput::TransferConfig;
 use crate::speedtest::select::LatencyMeasurement;
+use crate::speedtest::throughput::{ThroughputResult, TransferConfig};
 use crate::speedtest::upload::{self, UploadProgress};
 use crate::util::clamp_worker_count;
 
 use super::engine::{
     EngineEvent, EngineInputs, EngineOutcome, EngineStage, EngineState, SelectionOutcome,
-    apply_download_stats_to_server_pool, average_latency_ms,
-    build_benchmark_result, build_mst_buckets, build_mst_speeds, build_remote_upload_intervals,
-    push_interval, spawn_loaded_latency_task,
+    apply_download_stats_to_server_pool, average_latency_ms, build_benchmark_result,
+    build_mst_buckets, build_mst_speeds, build_remote_upload_intervals, push_interval,
+    spawn_loaded_latency_task,
 };
 
 pub(crate) fn finalize_engine_outcome<F>(
@@ -56,6 +56,52 @@ where
         },
         transfer_pool: selection.transfer_pool,
     })
+}
+
+fn record_latency_samples(
+    result_latency: &mut Option<f64>,
+    artifact_latency_samples: &mut Option<Vec<f64>>,
+    latency_samples: Vec<f64>,
+) {
+    *result_latency = average_latency_ms(&latency_samples);
+    *artifact_latency_samples = (!latency_samples.is_empty()).then_some(latency_samples);
+}
+
+fn finalize_local_intervals(
+    intervals: &mut Vec<crate::model::ThroughputInterval>,
+    stage_seconds: u64,
+    bytes: u64,
+    mbps: f64,
+) -> Vec<crate::model::ThroughputInterval> {
+    push_interval(intervals, stage_seconds as f64, bytes, mbps);
+    intervals.clone()
+}
+
+struct DirectionRequestStats {
+    request_attempts: u64,
+    request_successes: u64,
+    request_http_errors: u64,
+    request_transport_errors: u64,
+    response_read_errors: u64,
+}
+
+fn build_direction_details(
+    request_stats: DirectionRequestStats,
+    intervals: Vec<crate::model::ThroughputInterval>,
+    remote_intervals: Option<Vec<crate::model::ThroughputInterval>>,
+    throughput: Option<&ThroughputResult>,
+) -> DirectionDetails {
+    DirectionDetails {
+        request_attempts: request_stats.request_attempts,
+        request_successes: request_stats.request_successes,
+        request_http_errors: request_stats.request_http_errors,
+        request_transport_errors: request_stats.request_transport_errors,
+        response_read_errors: request_stats.response_read_errors,
+        intervals,
+        remote_intervals,
+        mst_speeds: build_mst_speeds(throughput),
+        mst_buckets: build_mst_buckets(throughput),
+    }
 }
 
 pub(crate) async fn run_download_stage<F>(
@@ -111,14 +157,14 @@ where
     )
     .await?;
 
-    let download_latency_samples = latency_task.await.unwrap_or_default();
-    state.result.download_latency_ms = average_latency_ms(&download_latency_samples);
-    state.sdk_artifacts.download_latency_samples_ms =
-        (!download_latency_samples.is_empty()).then_some(download_latency_samples);
-
-    push_interval(
+    record_latency_samples(
+        &mut state.result.download_latency_ms,
+        &mut state.sdk_artifacts.download_latency_samples_ms,
+        latency_task.await.unwrap_or_default(),
+    );
+    let local_intervals = finalize_local_intervals(
         &mut intervals,
-        inputs.settings.download_seconds as f64,
+        inputs.settings.download_seconds,
         stats.bytes,
         stats.mbps,
     );
@@ -131,20 +177,22 @@ where
         stats.actual_duration_ms,
         stats.throughput.as_ref(),
     ));
-    state.sdk_artifacts.download_intervals = (!intervals.is_empty()).then_some(intervals.clone());
+    state.sdk_artifacts.download_intervals =
+        (!local_intervals.is_empty()).then_some(local_intervals.clone());
 
     if let Some(details) = state.result.details.as_mut() {
-        details.download = Some(DirectionDetails {
-            request_attempts: stats.request_attempts,
-            request_successes: stats.request_successes,
-            request_http_errors: stats.request_http_errors,
-            request_transport_errors: stats.request_transport_errors,
-            response_read_errors: stats.response_read_errors,
-            intervals,
-            remote_intervals: None,
-            mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
-            mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
-        });
+        details.download = Some(build_direction_details(
+            DirectionRequestStats {
+                request_attempts: stats.request_attempts,
+                request_successes: stats.request_successes,
+                request_http_errors: stats.request_http_errors,
+                request_transport_errors: stats.request_transport_errors,
+                response_read_errors: stats.response_read_errors,
+            },
+            local_intervals,
+            None,
+            stats.throughput.as_ref(),
+        ));
     }
 
     apply_download_stats_to_server_pool(&mut state.result.server_pool, &stats.per_server);
@@ -211,14 +259,14 @@ where
     )
     .await?;
 
-    let upload_latency_samples = latency_task.await.unwrap_or_default();
-    state.result.upload_latency_ms = average_latency_ms(&upload_latency_samples);
-    state.sdk_artifacts.upload_latency_samples_ms =
-        (!upload_latency_samples.is_empty()).then_some(upload_latency_samples);
-
-    push_interval(
+    record_latency_samples(
+        &mut state.result.upload_latency_ms,
+        &mut state.sdk_artifacts.upload_latency_samples_ms,
+        latency_task.await.unwrap_or_default(),
+    );
+    let local_intervals = finalize_local_intervals(
         &mut intervals,
-        inputs.settings.upload_seconds as f64,
+        inputs.settings.upload_seconds,
         stats.bytes,
         stats.mbps,
     );
@@ -234,22 +282,24 @@ where
         stats.actual_duration_ms,
         stats.throughput.as_ref(),
     ));
-    state.sdk_artifacts.upload_intervals = (!intervals.is_empty()).then_some(intervals.clone());
+    state.sdk_artifacts.upload_intervals =
+        (!local_intervals.is_empty()).then_some(local_intervals.clone());
     state.sdk_artifacts.upload_remote_intervals =
         (!remote_intervals.is_empty()).then_some(remote_intervals.clone());
 
     if let Some(details) = state.result.details.as_mut() {
-        details.upload = Some(DirectionDetails {
-            request_attempts: stats.request_attempts,
-            request_successes: stats.request_successes,
-            request_http_errors: stats.request_http_errors,
-            request_transport_errors: stats.request_transport_errors,
-            response_read_errors: stats.response_read_errors,
-            intervals,
-            remote_intervals: (!remote_intervals.is_empty()).then_some(remote_intervals),
-            mst_speeds: build_mst_speeds(stats.throughput.as_ref()),
-            mst_buckets: build_mst_buckets(stats.throughput.as_ref()),
-        });
+        details.upload = Some(build_direction_details(
+            DirectionRequestStats {
+                request_attempts: stats.request_attempts,
+                request_successes: stats.request_successes,
+                request_http_errors: stats.request_http_errors,
+                request_transport_errors: stats.request_transport_errors,
+                response_read_errors: stats.response_read_errors,
+            },
+            local_intervals,
+            (!remote_intervals.is_empty()).then_some(remote_intervals),
+            stats.throughput.as_ref(),
+        ));
     }
 
     on_event(EngineEvent::StageResult {
