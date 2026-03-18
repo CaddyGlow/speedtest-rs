@@ -94,7 +94,8 @@ pub async fn upload_with_progress(
     while remaining > 0 {
         let chunk_len = min(remaining, DATA_BLOCK.len());
         write_all_with_timeout(stream, &DATA_BLOCK[..chunk_len], "UPLOAD payload").await?;
-        if first_byte_at.set(Instant::now()).is_ok() && let Some(first_transfer_tx) = first_transfer_tx
+        if first_byte_at.set(Instant::now()).is_ok()
+            && let Some(first_transfer_tx) = first_transfer_tx
         {
             let _ = first_transfer_tx.send(true);
         }

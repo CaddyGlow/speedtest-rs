@@ -8,6 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 
+use self::cache::run_cache_command;
+use self::speedtest_ui::SpeedtestUiController;
 use crate::cli::{Cli, Command, IperfArgs, IperfProtocol, RunArgs};
 use crate::http;
 use crate::iperf;
@@ -21,8 +23,6 @@ use crate::speedtest;
 use crate::speedtest::engine::{self, EngineSettings as StageEngineSettings};
 use crate::ui;
 use crate::util::{clamp_worker_count, resolve_proxy_url};
-use self::cache::run_cache_command;
-use self::speedtest_ui::SpeedtestUiController;
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli
@@ -106,7 +106,11 @@ async fn run_speedtest_with_stage_engine(args: RunArgs) -> Result<()> {
         .collect::<HashMap<_, _>>();
     ui.set_server_names(server_names);
 
-    let progress_interval = if render_ui { ui.progress_interval() } else { None };
+    let progress_interval = if render_ui {
+        ui.progress_interval()
+    } else {
+        None
+    };
 
     let transfer_mode = effective_args.mode.into();
 

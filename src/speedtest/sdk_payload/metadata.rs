@@ -147,7 +147,7 @@ pub(super) struct SdkConnections {
 pub(super) fn build_sdk_app() -> SdkApp {
     SdkApp {
         sdk: SdkAppVersion {
-            commit: "tunmux-generated".to_string(),
+            commit: "speedtest-rs-generated".to_string(),
             version: "3.1.1".to_string(),
         },
     }
@@ -211,7 +211,7 @@ pub(super) fn build_sdk_configs(
         host: hostname,
         port,
         server_version: "2.11.1".to_string(),
-        server_build: "tunmux-generated".to_string(),
+        server_build: "speedtest-rs-generated".to_string(),
     }
 }
 

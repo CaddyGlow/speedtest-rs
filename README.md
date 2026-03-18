@@ -1,8 +1,6 @@
-# tunmux-speedtest
+# speedtest-rs
 
-`tunmux-speedtest` is a standalone Rust CLI/TUI crate for Speedtest.net compatible benchmarking.
-
-It is intentionally separate from the `tunmux` workspace and has no dependency on `tunmux` internals.
+`speedtest-rs` is a standalone Rust CLI/TUI crate for Speedtest.net compatible benchmarking.
 
 ## Features
 
@@ -13,7 +11,7 @@ It is intentionally separate from the `tunmux` workspace and has no dependency o
 - transport switch: `--mode xhr|tcp`
 - pooled transfer across nearest measured servers (`--pool-size`)
 - modern session cache for cookies, guid, and client auth token
-- native `iperf` command with dedicated JSON schema (`tunmux.iperf.v1`)
+- native `iperf` command with dedicated JSON schema (`speedtest-rs.iperf.v1`)
 - live progress output with optional disable flag
 - live connectivity hook shows country/city/ip/org from ipinfo
 - human readable output plus SDK-compatible JSON output
@@ -74,8 +72,8 @@ Modern session cache path:
 
 - `run --json` emits a Speedtest SDK-style payload (`st4-js` model)
 
-- `${XDG_CACHE_HOME}/tunmux-speedtest/modern-session.json` when `XDG_CACHE_HOME` is set
-- `~/.cache/tunmux-speedtest/modern-session.json` otherwise
+- `${XDG_CACHE_HOME}/speedtest-rs/modern-session.json` when `XDG_CACHE_HOME` is set
+- `~/.cache/speedtest-rs/modern-session.json` otherwise
 
 Native iperf command examples:
 

@@ -214,7 +214,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should work")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("tunmux-iperf-test-{unique}.json"));
+        let path = std::env::temp_dir().join(format!("speedtest-rs-iperf-test-{unique}.json"));
         std::fs::write(
             &path,
             r#"{

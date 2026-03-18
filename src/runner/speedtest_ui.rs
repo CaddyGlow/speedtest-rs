@@ -142,7 +142,10 @@ impl SpeedtestUiController {
 
                 self.ui.render_metric(
                     "probe_progress",
-                    &format!("{}/{total} complete ({} failed)", self.probe_completed, self.probe_failed),
+                    &format!(
+                        "{}/{total} complete ({} failed)",
+                        self.probe_completed, self.probe_failed
+                    ),
                 );
             }
             engine::EngineEvent::ServerSelected {
@@ -205,13 +208,15 @@ impl SpeedtestUiController {
                 engine::EngineStage::Download => {
                     if let Some(progress) = self.download_progress.take() {
                         let (mbps, bytes) = self.download_last.unwrap_or((0.0, 0));
-                        self.ui.finish_speed_progress(progress, "download", mbps, bytes);
+                        self.ui
+                            .finish_speed_progress(progress, "download", mbps, bytes);
                     }
                 }
                 engine::EngineStage::Upload => {
                     if let Some(progress) = self.upload_progress.take() {
                         let (mbps, bytes) = self.upload_last.unwrap_or((0.0, 0));
-                        self.ui.finish_speed_progress(progress, "upload", mbps, bytes);
+                        self.ui
+                            .finish_speed_progress(progress, "upload", mbps, bytes);
                     }
                 }
                 _ => {}

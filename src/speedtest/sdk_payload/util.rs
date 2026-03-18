@@ -35,7 +35,11 @@ pub(super) fn bps_to_sdk_units(bps: u64) -> u64 {
     ((bps as f64) / 125.0).round() as u64
 }
 
-pub(super) fn calculate_result_hash(ping: f64, upload: Option<u64>, download: Option<u64>) -> String {
+pub(super) fn calculate_result_hash(
+    ping: f64,
+    upload: Option<u64>,
+    download: Option<u64>,
+) -> String {
     let ping = if ping.is_finite() { ping } else { 0.0 };
     let upload = upload.unwrap_or(0);
     let download = download.unwrap_or(0);

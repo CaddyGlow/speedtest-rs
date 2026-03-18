@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const CACHE_SUBDIR: &str = "tunmux-speedtest";
+const CACHE_SUBDIR: &str = "speedtest-rs";
 const SESSION_FILE_NAME: &str = "modern-session.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -142,7 +142,7 @@ pub fn generate_session_guid() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    format!("tunmux-{now:x}-{nanos:08x}-{}", std::process::id())
+    format!("speedtest-rs-{now:x}-{nanos:08x}-{}", std::process::id())
 }
 
 pub fn session_file_path() -> Result<PathBuf> {

@@ -1,4 +1,4 @@
-# Contributing to tunmux-speedtest
+# Contributing to speedtest-rs
 
 Thanks for contributing.
 

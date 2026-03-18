@@ -158,7 +158,10 @@ mod tests {
         }
         let rendered = strip_ansi(&s.render());
         let low_count = rendered.chars().filter(|&c| c == '▁').count();
-        assert!(low_count <= 2, "too many low bars ({low_count}), outlier is squashing the graph");
+        assert!(
+            low_count <= 2,
+            "too many low bars ({low_count}), outlier is squashing the graph"
+        );
     }
 
     #[test]

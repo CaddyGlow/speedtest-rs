@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::speedtest::session;
 
-const CACHE_SUBDIR: &str = "tunmux-speedtest";
+const CACHE_SUBDIR: &str = "speedtest-rs";
 const CACHE_FILE_NAME: &str = "servers.json";
 const MAX_CACHED_SERVERS: usize = 10_000;
 const MODERN_SDK_CONFIG_URL: &str =

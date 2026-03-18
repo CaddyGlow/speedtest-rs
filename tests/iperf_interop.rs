@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 fn binary_path() -> &'static str {
-    env!("CARGO_BIN_EXE_tunmux-speedtest")
+    env!("CARGO_BIN_EXE_speedtest-rs")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41,7 +41,7 @@ async fn iperf_tcp_direct_upload_json_smoke() {
     assert!(output.status.success(), "command failed: {:?}", output);
 
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
-    assert_eq!(body["schema"], "tunmux.iperf.v1");
+    assert_eq!(body["schema"], "speedtest-rs.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
 }
 
@@ -78,7 +78,7 @@ async fn iperf_tcp_http_proxy_upload_json_smoke() {
 
     assert!(output.status.success(), "command failed: {:?}", output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
-    assert_eq!(body["schema"], "tunmux.iperf.v1");
+    assert_eq!(body["schema"], "speedtest-rs.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
 }
 
@@ -119,7 +119,7 @@ async fn iperf_udp_socks5_proxy_upload_json_smoke() {
 
     assert!(output.status.success(), "command failed: {:?}", output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
-    assert_eq!(body["schema"], "tunmux.iperf.v1");
+    assert_eq!(body["schema"], "speedtest-rs.iperf.v1");
     assert!(body["results"]["upload"]["bytes"].as_u64().unwrap_or(0) > 0);
     assert!(body["results"]["upload"]["packets"].as_u64().unwrap_or(0) > 0);
 }

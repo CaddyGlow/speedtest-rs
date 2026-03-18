@@ -6,7 +6,7 @@ on:
       - "v*"
 
 env:
-  APP_NAME: tunmux-speedtest
+  APP_NAME: speedtest-rs
 
 jobs:
   test:

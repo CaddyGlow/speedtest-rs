@@ -1,7 +1,9 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::model::{BenchmarkResult, DirectionDetails, RunResult, SdkArtifacts, ThroughputInterval};
+use crate::model::{
+    BenchmarkResult, DirectionDetails, RunResult, SdkArtifacts, ThroughputInterval,
+};
 
 #[derive(Debug, Serialize)]
 pub(super) struct SdkDirectionSpeeds {

@@ -24,7 +24,7 @@ on:
         type: string
 
 env:
-  APP_NAME: tunmux-speedtest
+  APP_NAME: speedtest-rs
 
 jobs:
   build:

@@ -6,7 +6,7 @@ use crate::util::validate_proxy_scheme;
 
 pub fn build_client(proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
-        .user_agent("tunmux-speedtest/0.1.0")
+        .user_agent("speedtest-rs/0.1.0")
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(60));
 

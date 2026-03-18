@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
-use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -162,7 +162,7 @@ where
 
     let mut samples = worker.await.unwrap_or_default();
     if samples.is_empty() {
-        let guid = server.session_guid.as_deref().unwrap_or("tunmux-speedtest");
+        let guid = server.session_guid.as_deref().unwrap_or("speedtest-rs");
         let fallback_samples = (duration.as_millis() / 100).max(10) as usize;
         if let Ok(mut fallback) =
             browser_protocol::probe_latency_samples_http(client, server, guid, fallback_samples)
@@ -366,7 +366,7 @@ async fn probe_server_latency_modern_sdk(
 
     if successful_samples.len() < samples {
         let fallback_count = samples - successful_samples.len();
-        let guid = server.session_guid.as_deref().unwrap_or("tunmux-speedtest");
+        let guid = server.session_guid.as_deref().unwrap_or("speedtest-rs");
         debug!(
             server_id = server.id,
             host = %server.host,

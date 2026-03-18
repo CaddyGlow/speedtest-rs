@@ -1,5 +1,5 @@
 {
-  description = "tunmux-speedtest - Standalone Speedtest.net CLI/TUI with proxy support";
+  description = "speedtest-rs - Standalone Speedtest.net CLI with proxy support";
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-25.11";
@@ -30,7 +30,7 @@
 
       in {
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "tunmux-speedtest";
+          pname = "speedtest-rs";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;

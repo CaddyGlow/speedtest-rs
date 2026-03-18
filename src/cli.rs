@@ -222,7 +222,7 @@ pub struct IperfArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "tunmux-speedtest")]
+#[command(name = "speedtest-rs")]
 #[command(version = APP_VERSION)]
 #[command(about = "Standalone Speedtest.net CLI/TUI")]
 pub struct Cli {
@@ -271,33 +271,29 @@ mod tests {
 
     #[test]
     fn rejects_zero_connection_counts() {
-        let parse = Cli::try_parse_from(["tunmux-speedtest", "run", "--download-connections", "0"]);
+        let parse = Cli::try_parse_from(["speedtest-rs", "run", "--download-connections", "0"]);
 
         assert!(parse.is_err());
     }
 
     #[test]
     fn rejects_zero_durations() {
-        let parse = Cli::try_parse_from(["tunmux-speedtest", "run", "--upload-seconds", "0"]);
+        let parse = Cli::try_parse_from(["speedtest-rs", "run", "--upload-seconds", "0"]);
 
         assert!(parse.is_err());
     }
 
     #[test]
     fn rejects_download_only_and_upload_only_together() {
-        let parse = Cli::try_parse_from([
-            "tunmux-speedtest",
-            "run",
-            "--download-only",
-            "--upload-only",
-        ]);
+        let parse =
+            Cli::try_parse_from(["speedtest-rs", "run", "--download-only", "--upload-only"]);
 
         assert!(parse.is_err());
     }
 
     #[test]
     fn parses_modern_transport_mode() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--mode", "tcp"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "run", "--mode", "tcp"])
             .expect("run --mode tcp should parse");
 
         let Some(Command::Run(args)) = cli.command else {
@@ -309,13 +305,8 @@ mod tests {
 
     #[test]
     fn parses_sdk_json_out_flag() {
-        let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
-            "run",
-            "--sdk-json-out",
-            "sdk-result.json",
-        ])
-        .expect("run --sdk-json-out should parse");
+        let cli = Cli::try_parse_from(["speedtest-rs", "run", "--sdk-json-out", "sdk-result.json"])
+            .expect("run --sdk-json-out should parse");
 
         let Some(Command::Run(args)) = cli.command else {
             panic!("expected run command");
@@ -327,7 +318,7 @@ mod tests {
     #[test]
     fn parses_run_proxy_local_alias() {
         let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "run",
             "--proxy-local",
             "http://127.0.0.1:8080",
@@ -356,7 +347,7 @@ mod tests {
 
     #[test]
     fn accepts_run_details_with_json() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--json", "--details"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "run", "--json", "--details"])
             .expect("run --json --details should parse");
 
         let Some(Command::Run(args)) = cli.command else {
@@ -369,14 +360,14 @@ mod tests {
 
     #[test]
     fn rejects_run_details_without_json() {
-        let parse = Cli::try_parse_from(["tunmux-speedtest", "run", "--details"]);
+        let parse = Cli::try_parse_from(["speedtest-rs", "run", "--details"]);
 
         assert!(parse.is_err());
     }
 
     #[test]
     fn parses_run_no_progress_flag() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "run", "--no-progress"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "run", "--no-progress"])
             .expect("run --no-progress should parse");
 
         let Some(Command::Run(args)) = cli.command else {
@@ -389,7 +380,7 @@ mod tests {
     #[test]
     fn rejects_iperf_upload_only_and_download_only_together() {
         let parse = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "iperf",
             "--host",
             "127.0.0.1",
@@ -402,13 +393,8 @@ mod tests {
 
     #[test]
     fn rejects_iperf_details_without_json() {
-        let parse = Cli::try_parse_from([
-            "tunmux-speedtest",
-            "iperf",
-            "--host",
-            "127.0.0.1",
-            "--details",
-        ]);
+        let parse =
+            Cli::try_parse_from(["speedtest-rs", "iperf", "--host", "127.0.0.1", "--details"]);
 
         assert!(parse.is_err());
     }
@@ -416,7 +402,7 @@ mod tests {
     #[test]
     fn accepts_iperf_details_with_json() {
         let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "iperf",
             "--host",
             "127.0.0.1",
@@ -435,14 +421,14 @@ mod tests {
 
     #[test]
     fn iperf_requires_host() {
-        let parse = Cli::try_parse_from(["tunmux-speedtest", "iperf"]);
+        let parse = Cli::try_parse_from(["speedtest-rs", "iperf"]);
 
         assert!(parse.is_err());
     }
 
     #[test]
     fn iperf_accepts_auto_server_without_host() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "iperf", "--auto-server"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "iperf", "--auto-server"])
             .expect("iperf auto-server should parse");
 
         let Some(Command::Iperf(args)) = cli.command else {
@@ -456,7 +442,7 @@ mod tests {
 
     #[test]
     fn iperf_defaults_to_both_directions() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "iperf", "--host", "127.0.0.1"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "iperf", "--host", "127.0.0.1"])
             .expect("iperf should parse");
 
         let Some(Command::Iperf(args)) = cli.command else {
@@ -475,7 +461,7 @@ mod tests {
     #[test]
     fn parses_iperf_no_progress_flag() {
         let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "iperf",
             "--host",
             "127.0.0.1",
@@ -493,7 +479,7 @@ mod tests {
     #[test]
     fn parses_iperf_proxy_local_alias() {
         let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "iperf",
             "--host",
             "127.0.0.1",
@@ -512,7 +498,7 @@ mod tests {
     #[test]
     fn rejects_iperf_host_and_auto_server_together() {
         let parse = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "iperf",
             "--host",
             "127.0.0.1",
@@ -524,7 +510,7 @@ mod tests {
 
     #[test]
     fn parses_cache_show_defaults() {
-        let cli = Cli::try_parse_from(["tunmux-speedtest", "cache", "show"])
+        let cli = Cli::try_parse_from(["speedtest-rs", "cache", "show"])
             .expect("cache show should parse");
 
         let Some(Command::Cache(cache)) = cli.command else {
@@ -543,7 +529,7 @@ mod tests {
     #[test]
     fn parses_cache_show_search_and_limit() {
         let cli = Cli::try_parse_from([
-            "tunmux-speedtest",
+            "speedtest-rs",
             "cache",
             "show",
             "--search",

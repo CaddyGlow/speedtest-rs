@@ -16,12 +16,12 @@ use crate::model::{
 };
 use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::config::SpeedtestConfig;
+use crate::speedtest::download;
 use crate::speedtest::engine_stages::{
     finalize_engine_outcome, run_download_stage, run_upload_stage,
 };
 use crate::speedtest::select::{self, LatencyMeasurement, ServerLatency};
 use crate::speedtest::servers::SpeedtestServer;
-use crate::speedtest::download;
 
 #[cfg(test)]
 const RESULT_HASH_SALT: &str = "817d699764d33f89c";
@@ -309,7 +309,11 @@ fn build_initial_run_result(
                 .collect::<Vec<_>>(),
         ),
         ping_ms: Some(selection.selected.average_ms),
-        jitter_ms: if jitter_ms > 0.0 { Some(jitter_ms) } else { None },
+        jitter_ms: if jitter_ms > 0.0 {
+            Some(jitter_ms)
+        } else {
+            None
+        },
         download: None,
         download_latency_ms: None,
         upload: None,

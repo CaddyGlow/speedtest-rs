@@ -20,6 +20,6 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/tunmux-speedtest /usr/local/bin/tunmux-speedtest
+COPY --from=builder /app/target/release/speedtest-rs /usr/local/bin/speedtest-rs
 
-ENTRYPOINT ["tunmux-speedtest"]
+ENTRYPOINT ["speedtest-rs"]

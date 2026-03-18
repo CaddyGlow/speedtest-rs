@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const IPERF_SCHEMA_V1: &str = "tunmux.iperf.v1";
+pub const IPERF_SCHEMA_V1: &str = "speedtest-rs.iperf.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IperfJsonV1 {
@@ -123,7 +123,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&body).expect("json serialization should succeed");
-        assert!(json.contains("\"schema\":\"tunmux.iperf.v1\""));
+        assert!(json.contains("\"schema\":\"speedtest-rs.iperf.v1\""));
         assert!(json.contains("\"download\":null"));
     }
 }

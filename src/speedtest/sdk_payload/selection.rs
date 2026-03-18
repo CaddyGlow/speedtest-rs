@@ -107,10 +107,7 @@ pub(super) fn parse_host_and_port(host: &str, fallback_url: &str) -> (String, u1
     (hostname, port)
 }
 
-pub(super) fn build_server_list_entry(
-    server: &Server,
-    client: &ClientMeta,
-) -> SdkServerListEntry {
+pub(super) fn build_server_list_entry(server: &Server, client: &ClientMeta) -> SdkServerListEntry {
     let fallback_url = server.url_fallback();
     let (hostname, port) = parse_host_and_port(&server.host, &fallback_url);
 

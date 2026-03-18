@@ -126,9 +126,12 @@ mod tests {
     #[test]
     fn builds_sdk_payload_from_run_result() {
         let (result, sdk_artifacts) = sample_result();
-        let payload =
-            build_sdk_result_payload(&result, &sdk_artifacts, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
-                .expect("payload should build");
+        let payload = build_sdk_result_payload(
+            &result,
+            &sdk_artifacts,
+            "eca27dc9-e3dd-429a-85e7-8ee178facc6c",
+        )
+        .expect("payload should build");
 
         assert_eq!(payload["source"], "st4-js");
         assert_eq!(payload["serverid"], 61301);
@@ -174,7 +177,7 @@ mod tests {
     fn writes_sdk_payload_file() {
         let (result, sdk_artifacts) = sample_result();
         let temp =
-            std::env::temp_dir().join(format!("tunmux-speedtest-sdk-{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("speedtest-rs-sdk-{}.json", std::process::id()));
 
         let guid = write_sdk_result_json_file(&result, &sdk_artifacts, &temp, Some("guid-123"))
             .expect("must write payload file");
@@ -191,9 +194,12 @@ mod tests {
         let (mut result, sdk_artifacts) = sample_result();
         result.upload = None;
 
-        let payload =
-            build_sdk_result_payload(&result, &sdk_artifacts, "eca27dc9-e3dd-429a-85e7-8ee178facc6c")
-                .expect("payload should build without upload");
+        let payload = build_sdk_result_payload(
+            &result,
+            &sdk_artifacts,
+            "eca27dc9-e3dd-429a-85e7-8ee178facc6c",
+        )
+        .expect("payload should build without upload");
 
         assert!(payload.get("upload").is_none());
         assert!(payload.get("uploadSpeeds").is_none());
