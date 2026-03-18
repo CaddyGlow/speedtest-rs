@@ -15,12 +15,12 @@ use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
-use crate::speedtest::throughput::{ThroughputCalculator, ThroughputResult, TransferConfig};
+use crate::speedtest::throughput::{ThroughputResult, TransferConfig};
 use crate::speedtest::transfer_util::{
-    ActiveConnectionGuard, TransferLoopState, TransferSample, close_tcp_worker_stream,
-    drain_join_set, elapsed_ms_since, ensure_tcp_worker_stream, new_transfer_control,
+    ActiveConnectionGuard, TransferLoopContext, TransferSample, close_tcp_worker_stream,
+    drain_join_set, elapsed_ms_since, ensure_tcp_worker_stream, new_transfer_stage_runtime,
     normalize_server_pool, record_browser_request_error, reset_tcp_worker_stream,
-    resolve_ready_server_pool, run_transfer_loop, spawn_worker_range,
+    resolve_default_guid, resolve_ready_pool_by_mode, run_transfer_loop, spawn_worker_range,
 };
 use crate::util::clamp_worker_count;
 
@@ -74,15 +74,7 @@ where
     let response_read_errors = Arc::new(AtomicU64::new(0));
     let active_connections = Arc::new(AtomicUsize::new(0));
     let transfer_pool = normalize_server_pool(selected_server, server_pool);
-    let default_guid = selected_server
-        .session_guid
-        .clone()
-        .or_else(|| {
-            transfer_pool
-                .iter()
-                .find_map(|server| server.session_guid.clone())
-        })
-        .unwrap_or_else(|| "tunmux-speedtest".to_string());
+    let default_guid = resolve_default_guid(selected_server, &transfer_pool);
     let ready_pool = resolve_ready_upload_pool(client, mode, &transfer_pool, &default_guid).await;
     if ready_pool.is_empty() {
         bail!("no speedtest servers became ready for upload stage");
@@ -91,19 +83,14 @@ where
         .iter()
         .any(|server| server.id == selected_server.id);
 
-    let start_at = Instant::now();
-    let stage_end_at = start_at + Duration::from_secs(config.max_seconds);
     let mut upload_stats_task = None;
     let mut remote_stats_background_task = None;
     let mut remote_stats_background_stop = None;
     let mut upload_stats_rx = None;
     let mut latest_remote_sample = None;
     let mut remote_samples = Vec::new();
-    let control = new_transfer_control(worker_count, config.start_request_size);
-    let stage_stop_rx = control.stage_stop_rx.clone();
-    let first_transfer_tx = control.first_transfer_tx.clone();
-    let mut first_transfer_rx = control.first_transfer_rx.clone();
-    let first_byte_at = Arc::clone(&control.first_byte_at);
+    let mut runtime =
+        new_transfer_stage_runtime(worker_count, config.start_request_size, config.max_seconds);
 
     if matches!(mode, TransportProtocol::Xhr)
         && selected_server_ready
@@ -155,65 +142,59 @@ where
         upload_stats_rx = Some(rx);
     }
 
-    let target_workers = Arc::clone(&control.target_workers);
-    let suggested_size = Arc::clone(&control.suggested_size);
+    spawn_worker_range(
+        0..worker_count,
+        &mut runtime.tasks,
+        |idx, tasks| match mode {
+            TransportProtocol::Tcp => spawn_upload_worker_tcp(
+                idx,
+                &ready_pool,
+                &total_bytes,
+                &request_attempts,
+                &request_successes,
+                &request_transport_errors,
+                &response_read_errors,
+                &active_connections,
+                &runtime.target_workers,
+                &runtime.suggested_size,
+                &runtime.first_byte_at,
+                &runtime.stage_stop_rx,
+                &runtime.first_transfer_tx,
+                tasks,
+            ),
+            TransportProtocol::Xhr => spawn_upload_worker_xhr(
+                idx,
+                client,
+                &ready_pool,
+                &default_guid,
+                &total_bytes,
+                &request_attempts,
+                &request_successes,
+                &request_http_errors,
+                &request_transport_errors,
+                &response_read_errors,
+                &active_connections,
+                &runtime.target_workers,
+                &runtime.suggested_size,
+                &runtime.first_byte_at,
+                &runtime.stage_stop_rx,
+                &runtime.first_transfer_tx,
+                tasks,
+            ),
+        },
+    );
 
-    let mut tasks = JoinSet::new();
-    let mut loop_state = TransferLoopState {
-        stage_end_at,
-        progress_clock_start: None,
-        transfer_started: false,
-        last_progress_at: None,
-        spawned_count: worker_count,
-    };
-    spawn_worker_range(0..worker_count, &mut tasks, |idx, tasks| match mode {
-        TransportProtocol::Tcp => spawn_upload_worker_tcp(
-            idx,
-            &ready_pool,
-            &total_bytes,
-            &request_attempts,
-            &request_successes,
-            &request_transport_errors,
-            &response_read_errors,
-            &active_connections,
-            &target_workers,
-            &suggested_size,
-            &first_byte_at,
-            &stage_stop_rx,
-            &first_transfer_tx,
-            tasks,
-        ),
-        TransportProtocol::Xhr => spawn_upload_worker_xhr(
-            idx,
-            client,
-            &ready_pool,
-            &default_guid,
-            &total_bytes,
-            &request_attempts,
-            &request_successes,
-            &request_http_errors,
-            &request_transport_errors,
-            &response_read_errors,
-            &active_connections,
-            &target_workers,
-            &suggested_size,
-            &first_byte_at,
-            &stage_stop_rx,
-            &first_transfer_tx,
-            tasks,
-        ),
-    });
-
-    let mut calc = ThroughputCalculator::new(config.max_seconds * 1000);
     run_transfer_loop(
-        &mut tasks,
-        &mut first_transfer_rx,
-        &control,
-        &mut loop_state,
-        STAGE_POLL_INTERVAL,
-        config,
-        &active_connections,
-        &mut calc,
+        TransferLoopContext {
+            tasks: &mut runtime.tasks,
+            first_transfer_rx: &mut runtime.first_transfer_rx,
+            control: &runtime.control,
+            loop_state: &mut runtime.loop_state,
+            poll_interval: STAGE_POLL_INTERVAL,
+            config,
+            active_connections: &active_connections,
+            calc: &mut runtime.calc,
+        },
         |_, elapsed| {
             if let Some(rx) = upload_stats_rx.as_mut() {
                 while let Ok(sample) = rx.try_recv() {
@@ -227,11 +208,12 @@ where
                 remote_sample_rate(sample, elapsed).map(|(bytes, mbps)| (sample, bytes, mbps))
             });
 
-            let (sample_elapsed_ms, sample_bytes) = if let Some((sample, bytes, _)) = remote_progress {
-                (sample.elapsed_ms, bytes)
-            } else {
-                (elapsed.as_millis() as u64, local_bytes)
-            };
+            let (sample_elapsed_ms, sample_bytes) =
+                if let Some((sample, bytes, _)) = remote_progress {
+                    (sample.elapsed_ms, bytes)
+                } else {
+                    (elapsed.as_millis() as u64, local_bytes)
+                };
 
             let (progress_bytes, progress_mbps) = if let Some((_, bytes, mbps)) = remote_progress {
                 (bytes, Some(mbps))
@@ -260,11 +242,11 @@ where
                     &request_transport_errors,
                     &response_read_errors,
                     &active_connections,
-                    &target_workers,
-                    &suggested_size,
-                    &first_byte_at,
-                    &stage_stop_rx,
-                    &first_transfer_tx,
+                    &runtime.target_workers,
+                    &runtime.suggested_size,
+                    &runtime.first_byte_at,
+                    &runtime.stage_stop_rx,
+                    &runtime.first_transfer_tx,
                     tasks,
                 ),
                 TransportProtocol::Xhr => spawn_upload_worker_xhr(
@@ -279,11 +261,11 @@ where
                     &request_transport_errors,
                     &response_read_errors,
                     &active_connections,
-                    &target_workers,
-                    &suggested_size,
-                    &first_byte_at,
-                    &stage_stop_rx,
-                    &first_transfer_tx,
+                    &runtime.target_workers,
+                    &runtime.suggested_size,
+                    &runtime.first_byte_at,
+                    &runtime.stage_stop_rx,
+                    &runtime.first_transfer_tx,
                     tasks,
                 ),
             });
@@ -299,7 +281,7 @@ where
     )
     .await;
 
-    drain_join_set(&mut tasks, STAGE_JOIN_GRACE_PERIOD).await;
+    drain_join_set(&mut runtime.tasks, STAGE_JOIN_GRACE_PERIOD).await;
 
     if let Some(rx) = upload_stats_rx.as_mut() {
         while let Ok(sample) = rx.try_recv() {
@@ -361,8 +343,8 @@ where
         let _ = timeout(Duration::from_millis(900), &mut background_task).await;
     }
 
-    let throughput_result = calc.finish();
-    let actual_duration_ms = elapsed_ms_since(loop_state.progress_clock_start);
+    let throughput_result = runtime.calc.finish();
+    let actual_duration_ms = elapsed_ms_since(runtime.loop_state.progress_clock_start);
 
     let min_remote_elapsed_ms = config.max_seconds.saturating_mul(800);
     let remote_final_sample = remote_samples
@@ -415,40 +397,24 @@ async fn resolve_ready_upload_pool(
     server_pool: &[SpeedtestServer],
     default_guid: &str,
 ) -> Vec<SpeedtestServer> {
-    let probe_client = client.clone();
-    resolve_ready_server_pool(server_pool, default_guid, move |server, guid| {
-        let probe_client = probe_client.clone();
-        async move {
-            match mode {
-                TransportProtocol::Tcp => {
-                    match timeout(SERVER_READINESS_TIMEOUT, modern_protocol::connect(&server)).await
-                    {
-                        Ok(Ok(mut stream)) => {
-                            let _ = modern_protocol::quit(&mut stream).await;
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-                TransportProtocol::Xhr => {
-                    let probe_payload = vec![0x52_u8; UPLOAD_READINESS_BYTES];
-                    matches!(
-                        timeout(
-                            SERVER_READINESS_TIMEOUT,
-                            browser_protocol::upload(
-                                &probe_client,
-                                &server,
-                                &guid,
-                                &probe_payload,
-                            ),
-                        )
-                        .await,
-                        Ok(Ok(_))
-                    )
-                }
-            }
-        }
-    })
+    resolve_ready_pool_by_mode(
+        client,
+        mode,
+        server_pool,
+        default_guid,
+        SERVER_READINESS_TIMEOUT,
+        |probe_client, server, guid| async move {
+            let probe_payload = vec![0x52_u8; UPLOAD_READINESS_BYTES];
+            matches!(
+                timeout(
+                    SERVER_READINESS_TIMEOUT,
+                    browser_protocol::upload(&probe_client, &server, &guid, &probe_payload,),
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        },
+    )
     .await
 }
 

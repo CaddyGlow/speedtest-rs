@@ -352,8 +352,7 @@ impl ThroughputCalculator {
             if start_bucket.start_ms < half_elapsed {
                 continue;
             }
-            let bytes_before_start =
-                start_bucket.total_bytes.saturating_sub(start_bucket.bytes);
+            let bytes_before_start = start_bucket.total_bytes.saturating_sub(start_bucket.bytes);
 
             for end_bucket in &buckets[i..] {
                 let window_ms = end_bucket.stop_ms.saturating_sub(start_bucket.start_ms);
@@ -568,7 +567,7 @@ mod tests {
         for step in 0..=80 {
             let t: u64 = step * 50;
             let bucket_index = t / 500;
-            let rate: u64 = if bucket_index % 2 == 0 {
+            let rate: u64 = if bucket_index.is_multiple_of(2) {
                 2_000_000
             } else {
                 100_000

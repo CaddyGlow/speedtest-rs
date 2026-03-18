@@ -5,15 +5,17 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::task::JoinSet;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use crate::speedtest::api::TransportProtocol;
 use crate::speedtest::browser_protocol::TransferRequestError;
 use crate::speedtest::modern_protocol;
 use crate::speedtest::servers::SpeedtestServer;
 use crate::speedtest::throughput::{ThroughputCalculator, TransferConfig};
+use reqwest::Client;
 
 pub fn normalize_server_pool(
     selected_server: &SpeedtestServer,
@@ -68,6 +70,30 @@ pub struct TransferSample {
     pub progress_mbps: Option<f64>,
 }
 
+pub struct TransferStageRuntime {
+    pub control: TransferControl,
+    pub stage_stop_rx: watch::Receiver<bool>,
+    pub first_transfer_tx: watch::Sender<bool>,
+    pub first_transfer_rx: watch::Receiver<bool>,
+    pub first_byte_at: Arc<OnceLock<Instant>>,
+    pub target_workers: Arc<AtomicUsize>,
+    pub suggested_size: Arc<AtomicUsize>,
+    pub tasks: JoinSet<()>,
+    pub loop_state: TransferLoopState,
+    pub calc: ThroughputCalculator,
+}
+
+pub struct TransferLoopContext<'a> {
+    pub tasks: &'a mut JoinSet<()>,
+    pub first_transfer_rx: &'a mut watch::Receiver<bool>,
+    pub control: &'a TransferControl,
+    pub loop_state: &'a mut TransferLoopState,
+    pub poll_interval: Duration,
+    pub config: &'a TransferConfig,
+    pub active_connections: &'a AtomicUsize,
+    pub calc: &'a mut ThroughputCalculator,
+}
+
 pub fn new_transfer_control(worker_count: usize, start_request_size: usize) -> TransferControl {
     let (stage_stop_tx, stage_stop_rx) = watch::channel(false);
     let (first_transfer_tx, first_transfer_rx) = watch::channel(false);
@@ -81,6 +107,89 @@ pub fn new_transfer_control(worker_count: usize, start_request_size: usize) -> T
         target_workers: Arc::new(AtomicUsize::new(worker_count)),
         suggested_size: Arc::new(AtomicUsize::new(start_request_size)),
     }
+}
+
+pub fn resolve_default_guid(
+    selected_server: &SpeedtestServer,
+    transfer_pool: &[SpeedtestServer],
+) -> String {
+    selected_server
+        .session_guid
+        .clone()
+        .or_else(|| {
+            transfer_pool
+                .iter()
+                .find_map(|server| server.session_guid.clone())
+        })
+        .unwrap_or_else(|| "speedtest-rs".to_string())
+}
+
+pub fn new_transfer_stage_runtime(
+    worker_count: usize,
+    start_request_size: usize,
+    max_seconds: u64,
+) -> TransferStageRuntime {
+    let control = new_transfer_control(worker_count, start_request_size);
+    let stage_stop_rx = control.stage_stop_rx.clone();
+    let first_transfer_tx = control.first_transfer_tx.clone();
+    let first_transfer_rx = control.first_transfer_rx.clone();
+    let first_byte_at = Arc::clone(&control.first_byte_at);
+    let target_workers = Arc::clone(&control.target_workers);
+    let suggested_size = Arc::clone(&control.suggested_size);
+    let stage_end_at = Instant::now() + Duration::from_secs(max_seconds);
+
+    TransferStageRuntime {
+        control,
+        stage_stop_rx,
+        first_transfer_tx,
+        first_transfer_rx,
+        first_byte_at,
+        target_workers,
+        suggested_size,
+        tasks: JoinSet::new(),
+        loop_state: TransferLoopState {
+            stage_end_at,
+            progress_clock_start: None,
+            transfer_started: false,
+            last_progress_at: None,
+            spawned_count: worker_count,
+        },
+        calc: ThroughputCalculator::new(max_seconds * 1000),
+    }
+}
+
+pub async fn resolve_ready_pool_by_mode<Probe, Fut>(
+    client: &Client,
+    mode: TransportProtocol,
+    server_pool: &[SpeedtestServer],
+    default_guid: &str,
+    readiness_timeout: Duration,
+    xhr_probe: Probe,
+) -> Vec<SpeedtestServer>
+where
+    Probe: Fn(Client, SpeedtestServer, String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let probe_client = client.clone();
+    resolve_ready_server_pool(server_pool, default_guid, move |server, guid| {
+        let probe_client = probe_client.clone();
+        let xhr_probe = xhr_probe.clone();
+        async move {
+            match mode {
+                TransportProtocol::Tcp => {
+                    match timeout(readiness_timeout, modern_protocol::connect(&server)).await {
+                        Ok(Ok(mut stream)) => {
+                            let _ = modern_protocol::quit(&mut stream).await;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                TransportProtocol::Xhr => xhr_probe(probe_client, server, guid).await,
+            }
+        }
+    })
+    .await
 }
 
 pub async fn resolve_ready_server_pool<F, Fut>(
@@ -184,14 +293,7 @@ pub fn should_emit_progress(
 }
 
 pub async fn run_transfer_loop<Sample, Spawn, Report>(
-    tasks: &mut JoinSet<()>,
-    first_transfer_rx: &mut watch::Receiver<bool>,
-    control: &TransferControl,
-    loop_state: &mut TransferLoopState,
-    poll_interval: Duration,
-    config: &TransferConfig,
-    active_connections: &AtomicUsize,
-    calc: &mut ThroughputCalculator,
+    context: TransferLoopContext<'_>,
     mut sample_progress: Sample,
     mut spawn_workers: Spawn,
     mut report_progress: Report,
@@ -200,6 +302,17 @@ pub async fn run_transfer_loop<Sample, Spawn, Report>(
     Spawn: FnMut(Range<usize>, &mut JoinSet<()>),
     Report: FnMut(Duration, u64, f64, usize),
 {
+    let TransferLoopContext {
+        tasks,
+        first_transfer_rx,
+        control,
+        loop_state,
+        poll_interval,
+        config,
+        active_connections,
+        calc,
+    } = context;
+
     loop {
         sync_transfer_start(
             &mut loop_state.transfer_started,

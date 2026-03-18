@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::ui::sparkline::Sparkline;
 use crate::ui::SpeedProgressSample;
+use crate::ui::sparkline::Sparkline;
 
 struct MetricLine {
     key: String,
@@ -144,11 +144,11 @@ impl CompactUi {
 
         let sparkline_index = progress.sample_index(sample.elapsed);
         let mut sparkline = progress.sparkline.borrow_mut();
-        if let Some(previous_index) = progress.last_sparkline_index.get() {
-            if sparkline_index > previous_index {
-                for idx in previous_index + 1..sparkline_index {
-                    sparkline.set(idx, mbps);
-                }
+        if let Some(previous_index) = progress.last_sparkline_index.get()
+            && sparkline_index > previous_index
+        {
+            for idx in previous_index + 1..sparkline_index {
+                sparkline.set(idx, mbps);
             }
         }
         sparkline.set(sparkline_index, mbps);
