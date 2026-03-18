@@ -1,16 +1,16 @@
 mod latency;
+mod metadata;
 mod selection;
 mod throughput;
 
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::debug;
 
 use crate::model::{BenchmarkResult, RunResult, SdkArtifacts};
@@ -19,9 +19,12 @@ use self::latency::{
     SdkLatencyPayload, calculate_jitter_ms, build_latency_payload, latency_stats,
     selected_latency_samples,
 };
+use self::metadata::{
+    SdkApp, SdkConfigs, SdkLocation, build_sdk_app, build_sdk_configs, build_sdk_location,
+    build_supplemental_data, infer_protocols, split_client_ips,
+};
 use self::selection::{
-    SdkServerListEntry, SdkServerSelection, build_server_list_entry, build_server_selection,
-    parse_host_and_port,
+    SdkServerSelection, build_server_list_entry, build_server_selection, parse_host_and_port,
 };
 use self::throughput::{
     SdkDirectionSpeeds, SdkThroughputSample, build_direction_samples, build_speed_profile,
@@ -107,6 +110,74 @@ pub fn build_sdk_result_payload(
         .iter()
         .map(|entry| build_server_list_entry(entry, client))
         .collect::<Vec<_>>();
+    let prepared = prepare_sdk_measurements(result, sdk_artifacts, server, ping_ms)?;
+
+    let payload = SdkPayload {
+        app: build_sdk_app(),
+        serverid: server.id,
+        testmethod: prepared.protocols.test_method.to_string(),
+        source: "st4-js".to_string(),
+        configs: build_sdk_configs(client, prepared.protocols, server_list, hostname, port),
+        location: Some(build_sdk_location(client)),
+        isp_name: client.isp.clone(),
+        ping: prepared.ping,
+        pings: prepared.pings,
+        jitter: prepared.jitter,
+        latency: prepared.latency,
+        guid: guid.to_string(),
+        server_selection_guid: guid.to_string(),
+        server_selection_method: "auto".to_string(),
+        server_selection: prepared.server_selection,
+        upload_measurement_method: prepared.upload_measurement_method.to_string(),
+        upload: prepared.upload,
+        upload_speeds: prepared.upload_speeds,
+        download: prepared.download,
+        download_speeds: prepared.download_speeds,
+        download_latency: prepared.download_latency,
+        upload_latency: prepared.upload_latency,
+        supplemental_data: prepared.supplemental_data,
+        download_samples: prepared.download_samples,
+        upload_samples: prepared.upload_samples,
+        spoofed: false,
+        clientip: prepared.clientip,
+        ip6_address: prepared.ip6_address,
+        hash: prepared.hash,
+    };
+
+    Ok(serde_json::to_value(payload)?)
+}
+
+fn mbps_to_bps(result: &BenchmarkResult) -> Result<u64> {
+    if !result.mbps.is_finite() || result.mbps < 0.0 {
+        bail!("throughput Mbps must be a finite non-negative number");
+    }
+    Ok((result.mbps * 1_000_000.0).round() as u64)
+}
+
+fn bps_to_sdk_units(bps: u64) -> u64 {
+    ((bps as f64) / 125.0).round() as u64
+}
+
+fn calculate_result_hash(ping: f64, upload: Option<u64>, download: Option<u64>) -> String {
+    let ping = if ping.is_finite() { ping } else { 0.0 };
+    let upload = upload.unwrap_or(0);
+    let download = download.unwrap_or(0);
+    let hash_input = format!("{ping}-{upload}-{download}-817d699764d33f89c");
+    format!("{:x}", md5::compute(hash_input))
+}
+
+fn prepare_sdk_measurements(
+    result: &RunResult,
+    sdk_artifacts: &SdkArtifacts,
+    server: &crate::model::Server,
+    ping_ms: f64,
+) -> Result<PreparedSdkMeasurements> {
+    let protocols = infer_protocols(result.speedtest_api.as_deref());
+    let pings = selected_latency_samples(result, sdk_artifacts).unwrap_or_else(|| vec![ping_ms]);
+    let ping = latency_stats(&pings)
+        .map(|stats| stats.min)
+        .unwrap_or(ping_ms);
+    let jitter = calculate_jitter_ms(&pings);
     let download_bps = result.download.as_ref().map(mbps_to_bps).transpose()?;
     let upload_effective_bps = result.upload.as_ref().map(mbps_to_bps).transpose()?;
     let upload_local_bps = if upload_effective_bps.is_some() {
@@ -115,12 +186,6 @@ pub fn build_sdk_result_payload(
         None
     };
     let upload_remote_bps = remote_upload_bps(result, sdk_artifacts);
-    let protocols = infer_protocols(result.speedtest_api.as_deref());
-    let pings = selected_latency_samples(result, sdk_artifacts).unwrap_or_else(|| vec![ping_ms]);
-    let ping = latency_stats(&pings)
-        .map(|stats| stats.min)
-        .unwrap_or(ping_ms);
-    let jitter = calculate_jitter_ms(&pings);
     let download_latency_samples = sdk_artifacts
         .download_latency_samples_ms
         .clone()
@@ -131,9 +196,6 @@ pub fn build_sdk_result_payload(
         .clone()
         .filter(|samples| !samples.is_empty())
         .unwrap_or_else(|| pings.clone());
-    let download = download_bps.map(bps_to_sdk_units);
-    let upload = upload_effective_bps.map(bps_to_sdk_units);
-    let (clientip, ip6_address) = split_client_ips(&client.ip);
     let latency =
         build_latency_payload(&pings, jitter, protocols.latency_connection_protocol, true);
     let download_latency = result.download.as_ref().and_then(|_| {
@@ -152,7 +214,6 @@ pub fn build_sdk_result_payload(
             false,
         )
     });
-    let supplemental_data = build_supplemental_data(result)?;
     let download_samples = if download_bps.is_some() {
         build_direction_samples(
             sdk_artifacts.download_intervals.as_deref(),
@@ -181,7 +242,6 @@ pub fn build_sdk_result_payload(
         .upload_remote_intervals
         .as_deref()
         .and_then(direction_samples_from_intervals);
-    let server_selection = build_server_selection(result, server, ping);
     let download_speed_profile = build_speed_profile(
         download_bps,
         download_samples.as_deref(),
@@ -200,12 +260,12 @@ pub fn build_sdk_result_payload(
     let download = download_speed_profile
         .as_ref()
         .map(|profile| bps_to_sdk_units(profile.combined))
-        .or(download);
+        .or(download_bps.map(bps_to_sdk_units));
     let upload = upload_remote_speed_profile
         .as_ref()
         .or(upload_local_speed_profile.as_ref())
         .map(|profile| bps_to_sdk_units(profile.combined))
-        .or(upload);
+        .or(upload_effective_bps.map(bps_to_sdk_units));
     let upload_measurement_method = if upload_remote_speed_profile.is_some() {
         "remote"
     } else {
@@ -225,175 +285,66 @@ pub fn build_sdk_result_payload(
         "building sdk upload speed profiles"
     );
 
+    let (clientip, ip6_address) = result
+        .client
+        .as_ref()
+        .map(|client| split_client_ips(&client.ip))
+        .unwrap_or((None, None));
+    let server_selection = build_server_selection(result, server, ping);
+    let supplemental_data = build_supplemental_data(result)?;
+    let upload_speeds = upload_effective_bps.map(|_| SdkDirectionSpeeds {
+        local: upload_local_speed_profile,
+        remote: upload_remote_speed_profile,
+    });
+    let download_speeds = download_bps.map(|_| SdkDirectionSpeeds {
+        local: download_speed_profile,
+        remote: None,
+    });
     let hash = calculate_result_hash(ping, upload, download);
 
-    let payload = SdkPayload {
-        app: SdkApp {
-            sdk: SdkAppVersion {
-                commit: "tunmux-generated".to_string(),
-                version: "3.1.1".to_string(),
-            },
-        },
-        serverid: server.id,
-        testmethod: protocols.test_method.to_string(),
-        source: "st4-js".to_string(),
-        configs: SdkConfigs {
-            remote_debugging: false,
-            max_display_servers: 20,
-            request_web_location: true,
-            short_tests: false,
-            automatic_stage_progression: false,
-            event_skip_interval: 2,
-            latency: SdkLatencyConfig { max_servers: 10 },
-            js_engine: SdkJsEngine {
-                save_content_type: "application/json".to_string(),
-                save_type: "st4-js".to_string(),
-            },
-            stages_list: vec![
-                "latency".to_string(),
-                "download".to_string(),
-                "upload".to_string(),
-                "save".to_string(),
-            ],
-            loaded_latency: SdkLoadedLatency { enabled: true },
-            swf: SdkSwf {
-                engine: "/engine.swf".to_string(),
-                express: "/expressInstall.swf".to_string(),
-            },
-            provider: SdkProvider {
-                country_code: client.country.clone(),
-                ip_address: client.ip.clone(),
-                isp_name: client.isp.clone(),
-                provider_name: client.isp.clone(),
-                isp_id: client.isp_id,
-                provider_hash: client.provider_hash.clone(),
-            },
-            vpn_detected: false,
-            log_errors_to_server: SdkLogErrorsToServer {
-                level: "warn".to_string(),
-                use_costanza: true,
-                max_per_client: 100,
-                allow_during_test: false,
-                expensive_stack_traces: true,
-            },
-            connections: SdkConnections {
-                is_vpn: false,
-                selection_method: "auto".to_string(),
-                mode: "multi".to_string(),
-            },
-            server_list,
-            latency_protocol: protocols.latency_protocol.to_string(),
-            download_protocol: protocols.download_protocol.to_string(),
-            upload_protocol: protocols.upload_protocol.to_string(),
-            host: hostname,
-            port,
-            server_version: "2.11.1".to_string(),
-            server_build: "tunmux-generated".to_string(),
-        },
-        location: Some(SdkLocation {
-            country: client.country.clone(),
-            country_code: client.country.clone(),
-            lat: client.latitude,
-            lon: client.longitude,
-        }),
-        isp_name: client.isp.clone(),
+    Ok(PreparedSdkMeasurements {
+        protocols,
         ping,
         pings,
         jitter,
         latency,
-        guid: guid.to_string(),
-        server_selection_guid: guid.to_string(),
-        server_selection_method: "auto".to_string(),
-        server_selection,
-        upload_measurement_method: upload_measurement_method.to_string(),
-        upload,
-        upload_speeds: upload_effective_bps.map(|_| SdkDirectionSpeeds {
-            local: upload_local_speed_profile,
-            remote: upload_remote_speed_profile,
-        }),
-        download,
-        download_speeds: download_bps.map(|_| SdkDirectionSpeeds {
-            local: download_speed_profile,
-            remote: None,
-        }),
         download_latency,
         upload_latency,
-        supplemental_data,
+        download,
+        upload,
         download_samples,
         upload_samples,
-        spoofed: false,
+        download_speeds,
+        upload_speeds,
+        server_selection,
+        upload_measurement_method,
         clientip,
         ip6_address,
+        supplemental_data,
         hash,
-    };
-
-    Ok(serde_json::to_value(payload)?)
+    })
 }
 
-fn mbps_to_bps(result: &BenchmarkResult) -> Result<u64> {
-    if !result.mbps.is_finite() || result.mbps < 0.0 {
-        bail!("throughput Mbps must be a finite non-negative number");
-    }
-    Ok((result.mbps * 1_000_000.0).round() as u64)
-}
-
-fn bps_to_sdk_units(bps: u64) -> u64 {
-    ((bps as f64) / 125.0).round() as u64
-}
-
-fn infer_protocols(speedtest_api: Option<&str>) -> SdkProtocols {
-    match speedtest_api {
-        Some("tcp") => SdkProtocols {
-            test_method: "wss,tcps,tcps",
-            latency_protocol: "ws",
-            download_protocol: "tcp",
-            upload_protocol: "tcp",
-            latency_connection_protocol: "wss",
-            download_connection_protocol: "tcps",
-            upload_connection_protocol: "tcps",
-        },
-        _ => SdkProtocols {
-            test_method: "wss,xhrs,xhrs",
-            latency_protocol: "ws",
-            download_protocol: "xhr",
-            upload_protocol: "xhr",
-            latency_connection_protocol: "wss",
-            download_connection_protocol: "xhrs",
-            upload_connection_protocol: "xhrs",
-        },
-    }
-}
-
-fn split_client_ips(client_ip: &str) -> (Option<String>, Option<String>) {
-    match client_ip.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) => (Some(client_ip.to_string()), None),
-        Ok(IpAddr::V6(_)) => (Some(client_ip.to_string()), Some(client_ip.to_string())),
-        Err(_) => (Some(client_ip.to_string()), None),
-    }
-}
-
-fn build_supplemental_data(result: &RunResult) -> Result<Value> {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "detailsIncluded".to_string(),
-        json!(result.details.is_some()),
-    );
-    payload.insert("proxy".to_string(), json!(result.proxy));
-    payload.insert("speedtestApi".to_string(), json!(result.speedtest_api));
-
-    if let Some(details) = result.details.as_ref() {
-        payload.insert("runDetails".to_string(), serde_json::to_value(details)?);
-    }
-
-    Ok(Value::Object(payload))
-}
-
-fn calculate_result_hash(ping: f64, upload: Option<u64>, download: Option<u64>) -> String {
-    let ping = if ping.is_finite() { ping } else { 0.0 };
-    let upload = upload.unwrap_or(0);
-    let download = download.unwrap_or(0);
-    let hash_input = format!("{ping}-{upload}-{download}-817d699764d33f89c");
-    format!("{:x}", md5::compute(hash_input))
+struct PreparedSdkMeasurements {
+    protocols: self::metadata::SdkProtocols,
+    ping: f64,
+    pings: Vec<f64>,
+    jitter: f64,
+    latency: Option<SdkLatencyPayload>,
+    download_latency: Option<SdkLatencyPayload>,
+    upload_latency: Option<SdkLatencyPayload>,
+    download: Option<u64>,
+    upload: Option<u64>,
+    download_samples: Option<Vec<SdkThroughputSample>>,
+    upload_samples: Option<Vec<SdkThroughputSample>>,
+    download_speeds: Option<SdkDirectionSpeeds>,
+    upload_speeds: Option<SdkDirectionSpeeds>,
+    server_selection: Option<SdkServerSelection>,
+    upload_measurement_method: &'static str,
+    clientip: Option<String>,
+    ip6_address: Option<String>,
+    supplemental_data: Value,
+    hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -445,144 +396,6 @@ struct SdkPayload {
     #[serde(rename = "ip6Address", skip_serializing_if = "Option::is_none")]
     ip6_address: Option<String>,
     hash: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SdkProtocols {
-    test_method: &'static str,
-    latency_protocol: &'static str,
-    download_protocol: &'static str,
-    upload_protocol: &'static str,
-    latency_connection_protocol: &'static str,
-    download_connection_protocol: &'static str,
-    upload_connection_protocol: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkApp {
-    sdk: SdkAppVersion,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkAppVersion {
-    commit: String,
-    version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkConfigs {
-    #[serde(rename = "remoteDebugging")]
-    remote_debugging: bool,
-    #[serde(rename = "maxDisplayServers")]
-    max_display_servers: u64,
-    #[serde(rename = "requestWebLocation")]
-    request_web_location: bool,
-    #[serde(rename = "shortTests")]
-    short_tests: bool,
-    #[serde(rename = "automaticStageProgression")]
-    automatic_stage_progression: bool,
-    #[serde(rename = "eventSkipInterval")]
-    event_skip_interval: u64,
-    latency: SdkLatencyConfig,
-    #[serde(rename = "jsEngine")]
-    js_engine: SdkJsEngine,
-    #[serde(rename = "stagesList")]
-    stages_list: Vec<String>,
-    #[serde(rename = "loadedLatency")]
-    loaded_latency: SdkLoadedLatency,
-    swf: SdkSwf,
-    provider: SdkProvider,
-    #[serde(rename = "vpnDetected")]
-    vpn_detected: bool,
-    #[serde(rename = "logErrorsToServer")]
-    log_errors_to_server: SdkLogErrorsToServer,
-    connections: SdkConnections,
-    #[serde(rename = "serverList")]
-    server_list: Vec<SdkServerListEntry>,
-    #[serde(rename = "latencyProtocol")]
-    latency_protocol: String,
-    #[serde(rename = "downloadProtocol")]
-    download_protocol: String,
-    #[serde(rename = "uploadProtocol")]
-    upload_protocol: String,
-    host: String,
-    port: u16,
-    #[serde(rename = "serverVersion")]
-    server_version: String,
-    #[serde(rename = "serverBuild")]
-    server_build: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkLatencyConfig {
-    #[serde(rename = "maxServers")]
-    max_servers: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkJsEngine {
-    #[serde(rename = "saveContentType")]
-    save_content_type: String,
-    #[serde(rename = "saveType")]
-    save_type: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkLoadedLatency {
-    enabled: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkSwf {
-    engine: String,
-    express: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkProvider {
-    #[serde(rename = "countryCode")]
-    country_code: String,
-    #[serde(rename = "ipAddress")]
-    ip_address: String,
-    #[serde(rename = "ispName")]
-    isp_name: String,
-    #[serde(rename = "providerName")]
-    provider_name: String,
-    #[serde(rename = "ispId", skip_serializing_if = "Option::is_none")]
-    isp_id: Option<u64>,
-    #[serde(rename = "providerHash", skip_serializing_if = "Option::is_none")]
-    provider_hash: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkLocation {
-    country: String,
-    #[serde(rename = "countryCode")]
-    country_code: String,
-    lat: f64,
-    lon: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkLogErrorsToServer {
-    level: String,
-    #[serde(rename = "useCostanza")]
-    use_costanza: bool,
-    #[serde(rename = "maxPerClient")]
-    max_per_client: u64,
-    #[serde(rename = "allowDuringTest")]
-    allow_during_test: bool,
-    #[serde(rename = "expensiveStackTraces")]
-    expensive_stack_traces: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct SdkConnections {
-    #[serde(rename = "isVpn")]
-    is_vpn: bool,
-    #[serde(rename = "selectionMethod")]
-    selection_method: String,
-    mode: String,
 }
 
 #[cfg(test)]
