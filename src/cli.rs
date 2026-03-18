@@ -3,6 +3,18 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use crate::speedtest::api::ModernTransportMode;
 
 const APP_VERSION: &str = env!("TUNMUX_SPEEDTEST_VERSION");
+const DEFAULT_CACHE_SHOW_LIMIT: usize = 20;
+const DEFAULT_RUN_CANDIDATE_SERVERS: usize = 10;
+const DEFAULT_RUN_POOL_SIZE: usize = 4;
+const DEFAULT_RUN_LATENCY_SAMPLES: usize = 10;
+const DEFAULT_RUN_DOWNLOAD_CONNECTIONS: usize = 24;
+const DEFAULT_RUN_UPLOAD_CONNECTIONS: usize = 8;
+const DEFAULT_RUN_DOWNLOAD_SECONDS: u64 = 15;
+const DEFAULT_RUN_UPLOAD_SECONDS: u64 = 15;
+const DEFAULT_IPERF_CANDIDATE_SERVERS: usize = 10;
+const DEFAULT_IPERF_LATENCY_SAMPLES: usize = 2;
+const DEFAULT_IPERF_SECONDS: u64 = 10;
+const DEFAULT_IPERF_PARALLEL: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum IperfProtocol {
@@ -13,7 +25,7 @@ pub enum IperfProtocol {
 #[derive(Debug, Clone, Args)]
 pub struct CacheShowArgs {
     /// Maximum number of entries to display
-    #[arg(long, default_value_t = 20, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_CACHE_SHOW_LIMIT, value_parser = parse_positive::<usize>)]
     pub limit: usize,
 
     /// Emit machine-readable JSON output
@@ -54,31 +66,31 @@ pub struct RunArgs {
     pub server_id: Option<u64>,
 
     /// Number of candidate servers to probe for latency
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_RUN_CANDIDATE_SERVERS, value_parser = parse_positive::<usize>)]
     pub candidate_servers: usize,
 
     /// Number of servers to include in transfer pool
-    #[arg(long = "pool-size", default_value_t = 4, value_parser = parse_positive_usize)]
+    #[arg(long = "pool-size", default_value_t = DEFAULT_RUN_POOL_SIZE, value_parser = parse_positive::<usize>)]
     pub pool_size: usize,
 
     /// Number of latency samples per candidate server
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_RUN_LATENCY_SAMPLES, value_parser = parse_positive::<usize>)]
     pub latency_samples: usize,
 
     /// Parallel download workers
-    #[arg(long, default_value_t = 24, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_RUN_DOWNLOAD_CONNECTIONS, value_parser = parse_positive::<usize>)]
     pub download_connections: usize,
 
     /// Parallel upload workers
-    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_RUN_UPLOAD_CONNECTIONS, value_parser = parse_positive::<usize>)]
     pub upload_connections: usize,
 
     /// Download phase duration in seconds
-    #[arg(long, default_value_t = 15, value_parser = parse_positive_u64)]
+    #[arg(long, default_value_t = DEFAULT_RUN_DOWNLOAD_SECONDS, value_parser = parse_positive::<u64>)]
     pub download_seconds: u64,
 
     /// Upload phase duration in seconds
-    #[arg(long, default_value_t = 15, value_parser = parse_positive_u64)]
+    #[arg(long, default_value_t = DEFAULT_RUN_UPLOAD_SECONDS, value_parser = parse_positive::<u64>)]
     pub upload_seconds: u64,
 
     /// Skip upload phase
@@ -112,6 +124,29 @@ pub struct RunArgs {
     pub sdk_json_out: Option<String>,
 }
 
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            mode: ModernTransportMode::Xhr,
+            server_id: None,
+            candidate_servers: DEFAULT_RUN_CANDIDATE_SERVERS,
+            pool_size: DEFAULT_RUN_POOL_SIZE,
+            latency_samples: DEFAULT_RUN_LATENCY_SAMPLES,
+            download_connections: DEFAULT_RUN_DOWNLOAD_CONNECTIONS,
+            upload_connections: DEFAULT_RUN_UPLOAD_CONNECTIONS,
+            download_seconds: DEFAULT_RUN_DOWNLOAD_SECONDS,
+            upload_seconds: DEFAULT_RUN_UPLOAD_SECONDS,
+            download_only: false,
+            upload_only: false,
+            proxy: None,
+            no_progress: false,
+            json: false,
+            details: false,
+            sdk_json_out: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("iperf_target")
@@ -136,11 +171,11 @@ pub struct IperfArgs {
     pub port: Option<u16>,
 
     /// Number of auto-selected candidates to probe
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_IPERF_CANDIDATE_SERVERS, value_parser = parse_positive::<usize>)]
     pub candidate_servers: usize,
 
     /// Latency samples per auto-selected candidate
-    #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_IPERF_LATENCY_SAMPLES, value_parser = parse_positive::<usize>)]
     pub latency_samples: usize,
 
     /// iperf protocol mode
@@ -148,15 +183,15 @@ pub struct IperfArgs {
     pub protocol: IperfProtocol,
 
     /// Test duration in seconds
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_u64)]
+    #[arg(long, default_value_t = DEFAULT_IPERF_SECONDS, value_parser = parse_positive::<u64>)]
     pub seconds: u64,
 
     /// Parallel worker streams
-    #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = DEFAULT_IPERF_PARALLEL, value_parser = parse_positive::<usize>)]
     pub parallel: usize,
 
     /// Optional target bitrate in bits per second (mainly for UDP)
-    #[arg(long, value_parser = parse_positive_u64)]
+    #[arg(long, value_parser = parse_positive::<u64>)]
     pub bitrate: Option<u64>,
 
     /// Optional HTTP/SOCKS5 proxy URL (falls back to http_proxy/https_proxy/all_proxy env vars)
@@ -210,43 +245,19 @@ pub enum Command {
 impl Default for Cli {
     fn default() -> Self {
         Self {
-            command: Some(Command::Run(RunArgs {
-                mode: ModernTransportMode::Xhr,
-                server_id: None,
-                candidate_servers: 10,
-                pool_size: 4,
-                latency_samples: 10,
-                download_connections: 24,
-                upload_connections: 8,
-                download_seconds: 15,
-                upload_seconds: 15,
-                download_only: false,
-                upload_only: false,
-                proxy: None,
-                no_progress: false,
-                json: false,
-                details: false,
-                sdk_json_out: None,
-            })),
+            command: Some(Command::Run(RunArgs::default())),
         }
     }
 }
 
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
+fn parse_positive<T>(value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
     let parsed = value
-        .parse::<usize>()
+        .parse::<T>()
         .map_err(|_| format!("invalid integer '{value}'"))?;
-    if parsed == 0 {
-        return Err("value must be greater than zero".to_string());
-    }
-    Ok(parsed)
-}
-
-fn parse_positive_u64(value: &str) -> Result<u64, String> {
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|_| format!("invalid integer '{value}'"))?;
-    if parsed == 0 {
+    if parsed == T::from(0) {
         return Err("value must be greater than zero".to_string());
     }
     Ok(parsed)
