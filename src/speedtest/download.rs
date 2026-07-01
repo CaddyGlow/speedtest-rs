@@ -566,7 +566,9 @@ mod tests {
             start.elapsed() < Duration::from_millis(1800),
             "download stage should stop near target duration"
         );
-        assert_eq!(stats.bytes, 0);
+        assert!(stats.bytes > 0);
+        assert!(stats.bytes < test_config.start_request_size as u64);
+        assert_eq!(stats.request_successes, 0);
 
         Ok(())
     }

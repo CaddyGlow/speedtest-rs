@@ -267,7 +267,18 @@ where
 mod tests {
     use clap::Parser;
 
-    use super::{CacheCommand, Cli, Command};
+    use super::{APP_VERSION, CacheCommand, Cli, Command};
+
+    #[test]
+    fn app_version_includes_git_hash() {
+        let (version, hash) = APP_VERSION
+            .rsplit_once(" (")
+            .expect("version should include git hash in parentheses");
+
+        assert!(!version.is_empty());
+        assert!(hash.ends_with(')'));
+        assert!(!hash.trim_end_matches(')').is_empty());
+    }
 
     #[test]
     fn rejects_zero_connection_counts() {
